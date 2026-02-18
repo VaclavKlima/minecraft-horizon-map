@@ -2,9 +2,8 @@
 
 namespace App\Services;
 
-use App\Jobs\GenerateCombinedMapTilesJob;
-use App\Jobs\RenderRegionMapTilesJob;
-use Illuminate\Bus\Batch;
+use App\Jobs\GenerateRegionTilesJob;
+use App\Jobs\RenderRegionMapImageJob;
 use Illuminate\Support\Facades\Bus;
 use RuntimeException;
 
@@ -27,17 +26,14 @@ class DispatchBirdsEyeMapBatch
             throw new RuntimeException('No region files found in public/region.');
         }
 
-        $jobs = array_map(
-            fn (string $regionFile): RenderRegionMapTilesJob => new RenderRegionMapTilesJob($regionFile, $heightmapType),
-            $regionFiles
-        );
+        $jobs = array_map(fn (string $regionFile): array => [
+            new RenderRegionMapImageJob($regionFile, $heightmapType),
+            new GenerateRegionTilesJob($regionFile),
+        ], $regionFiles);
 
         $batch = Bus::batch($jobs)
             ->name('Render Minecraft birds-eye map')
             ->allowFailures()
-            ->finally(static function (Batch $batch): void {
-                GenerateCombinedMapTilesJob::dispatch();
-            })
             ->dispatch();
 
         return [

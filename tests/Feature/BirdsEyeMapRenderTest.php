@@ -1,6 +1,7 @@
 <?php
 
-use App\Jobs\RenderRegionMapTilesJob;
+use App\Jobs\GenerateRegionTilesJob;
+use App\Jobs\RenderRegionMapImageJob;
 use Illuminate\Support\Facades\Bus;
 
 beforeEach(function (): void {
@@ -26,7 +27,12 @@ it('queues birds-eye map jobs through the api', function () {
 
     Bus::assertBatched(function ($batch): bool {
         return count($batch->jobs) > 0
-            && collect($batch->jobs)->every(fn (object $job): bool => $job instanceof RenderRegionMapTilesJob);
+            && collect($batch->jobs)->every(
+                fn (mixed $jobs): bool => is_array($jobs)
+                    && count($jobs) === 2
+                    && $jobs[0] instanceof RenderRegionMapImageJob
+                    && $jobs[1] instanceof GenerateRegionTilesJob
+            );
     });
 });
 
@@ -38,6 +44,11 @@ it('queues birds-eye map jobs through the command', function () {
 
     Bus::assertBatched(function ($batch): bool {
         return count($batch->jobs) > 0
-            && collect($batch->jobs)->every(fn (object $job): bool => $job instanceof RenderRegionMapTilesJob);
+            && collect($batch->jobs)->every(
+                fn (mixed $jobs): bool => is_array($jobs)
+                    && count($jobs) === 2
+                    && $jobs[0] instanceof RenderRegionMapImageJob
+                    && $jobs[1] instanceof GenerateRegionTilesJob
+            );
     });
 });

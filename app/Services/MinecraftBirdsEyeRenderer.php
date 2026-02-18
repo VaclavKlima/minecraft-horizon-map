@@ -441,13 +441,7 @@ class MinecraftBirdsEyeRenderer
             return null;
         }
 
-        $heights = $this->deriveHeightsFromSections($sections);
-
-        if (count($heights) < 256) {
-            return null;
-        }
-
-        $colors = $this->resolveTopColors($sections, $heights);
+        [$heights, $colors] = $this->resolveTopSurface($sections, $heightmaps[$heightmapType] ?? null);
 
         return [
             'heights' => $heights,
@@ -695,55 +689,23 @@ class MinecraftBirdsEyeRenderer
 
     /**
      * @param  array<int, array<string, mixed>>  $sections
-     * @return array<int, int>
+     * @param  array<int, string>|null  $heightmap
+     * @return array{0: array<int, int>, 1: array<int, array{0:int,1:int,2:int}>}
      */
-    private function deriveHeightsFromSections(array $sections): array
+    private function resolveTopSurface(array $sections, ?array $heightmap): array
     {
         $sectionYs = array_keys($sections);
         sort($sectionYs);
         $minY = ((int) min($sectionYs)) * 16;
         $maxY = (((int) max($sectionYs)) * 16) + 15;
         $heights = array_fill(0, 256, 0);
+        $colors = array_fill(0, 256, [90, 90, 92]);
+        $heightHints = $this->decodeHeightHints($heightmap, $minY, $maxY);
 
         for ($localZ = 0; $localZ < 16; $localZ++) {
             for ($localX = 0; $localX < 16; $localX++) {
-                $heightIndex = ($localZ * 16) + $localX;
-
-                for ($y = $maxY; $y >= $minY; $y--) {
-                    $sectionY = $this->floorDivide($y, 16);
-
-                    if (! array_key_exists($sectionY, $sections)) {
-                        continue;
-                    }
-
-                    if (! $this->isAirLikeBlock($this->blockNameAtY($sections[$sectionY], $localX, $localZ, $y))) {
-                        $heights[$heightIndex] = $y + 1;
-                        break;
-                    }
-                }
-            }
-        }
-
-        return $heights;
-    }
-
-    /**
-     * @param  array<int, array<string, mixed>>  $sections
-     * @param  array<int, int>  $heights
-     * @return array<int, array{0:int,1:int,2:int}>
-     */
-    private function resolveTopColors(array $sections, array $heights): array
-    {
-        $sectionYs = array_keys($sections);
-        sort($sectionYs);
-        $minY = ((int) min($sectionYs)) * 16;
-        $colors = [];
-
-        for ($localZ = 0; $localZ < 16; $localZ++) {
-            for ($localX = 0; $localX < 16; $localX++) {
-                $heightIndex = ($localZ * 16) + $localX;
-                $startY = max($minY, $heights[$heightIndex] - 1);
-                $color = [90, 90, 92];
+                $surfaceIndex = ($localZ * 16) + $localX;
+                $startY = $heightHints[$surfaceIndex] ?? $maxY;
 
                 for ($y = $startY; $y >= $minY; $y--) {
                     $sectionY = $this->floorDivide($y, 16);
@@ -755,16 +717,49 @@ class MinecraftBirdsEyeRenderer
                     $blockName = $this->blockNameAtY($sections[$sectionY], $localX, $localZ, $y);
 
                     if (! $this->isAirLikeBlock($blockName)) {
-                        $color = $this->colorForBlock($blockName);
+                        $heights[$surfaceIndex] = $y + 1;
+                        $colors[$surfaceIndex] = $this->colorForBlock($blockName);
                         break;
                     }
                 }
-
-                $colors[$heightIndex] = $color;
             }
         }
 
-        return $colors;
+        return [$heights, $colors];
+    }
+
+    /**
+     * @return array<int, array{0:int,1:int,2:int}>
+     */
+    private function decodeHeightHints(?array $heightmap, int $minY, int $maxY): array
+    {
+        if ($heightmap === null || $heightmap === []) {
+            return [];
+        }
+
+        $decodedHeights = $this->decodePackedValues($heightmap, 256, 9);
+
+        if (count($decodedHeights) !== 256) {
+            return [];
+        }
+
+        $hints = [];
+
+        foreach ($decodedHeights as $index => $heightValue) {
+            $normalized = $heightValue;
+
+            if ($normalized < $minY || $normalized > $maxY) {
+                $offsetHeight = $heightValue - 64;
+
+                if ($offsetHeight >= $minY && $offsetHeight <= $maxY) {
+                    $normalized = $offsetHeight;
+                }
+            }
+
+            $hints[$index] = max($minY, min($maxY, $normalized));
+        }
+
+        return $hints;
     }
 
     /**
@@ -774,13 +769,9 @@ class MinecraftBirdsEyeRenderer
     {
         $yInSection = (($worldY % 16) + 16) % 16;
         $blockIndex = ($yInSection * 256) + ($localZ * 16) + $localX;
-        $paletteIndex = 0;
+        $paletteIndex = $section['indices'][$blockIndex] ?? 0;
 
-        if ($section['indices'] !== null && array_key_exists($blockIndex, $section['indices'])) {
-            $paletteIndex = $section['indices'][$blockIndex];
-        }
-
-        if (! array_key_exists($paletteIndex, $section['palette'])) {
+        if (! isset($section['palette'][$paletteIndex])) {
             return 'minecraft:air';
         }
 

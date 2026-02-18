@@ -13,6 +13,8 @@ class MinecraftMapTileService
 
     private const OVERZOOM_LEVELS = 6;
 
+    private const EAGER_OVERZOOM_LEVELS = 0;
+
     public function __construct(private Filesystem $files) {}
 
     /**
@@ -103,7 +105,7 @@ class MinecraftMapTileService
         $sourceModifiedAt = $this->files->lastModified($sourcePath);
         $this->files->deleteDirectory($this->tilesRootPath($regionFile));
         $this->rebuildManifest($regionFile, $sourceModifiedAt);
-        $this->generateAllTilesFromManifest($regionFile);
+        $this->generateAllTilesFromManifest($regionFile, true);
     }
 
     public function rebuildCombinedTiles(): void
@@ -121,7 +123,7 @@ class MinecraftMapTileService
         $sourceSignature = $this->combinedSourceSignature($regions);
         $this->files->deleteDirectory($this->tilesRootPath(self::ALL_REGIONS));
         $this->rebuildCombinedManifest($regions, $sourceSignature);
-        $this->generateAllTilesFromManifest(self::ALL_REGIONS);
+        $this->generateAllTilesFromManifest(self::ALL_REGIONS, true);
     }
 
     private function ensureManifestIsFresh(string $regionFile): void
@@ -148,7 +150,7 @@ class MinecraftMapTileService
         }
     }
 
-    private function generateAllTilesFromManifest(string $regionFile): void
+    private function generateAllTilesFromManifest(string $regionFile, bool $eagerOnly = false): void
     {
         $manifestPath = $this->manifestPath($regionFile);
 
@@ -159,9 +161,14 @@ class MinecraftMapTileService
         /** @var array<string, mixed> $manifest */
         $manifest = json_decode($this->files->get($manifestPath), true, flags: JSON_THROW_ON_ERROR);
         $manifest['selected_region'] = $regionFile;
+        $maxEagerZoom = $eagerOnly ? $this->eagerMaxZoomForManifest($manifest) : null;
 
         foreach ($manifest['levels'] as $zoom => $level) {
             $zoomLevel = (int) $zoom;
+
+            if ($maxEagerZoom !== null && $zoomLevel > $maxEagerZoom) {
+                continue;
+            }
 
             for ($tileY = 0; $tileY < $level['tiles_y']; $tileY++) {
                 for ($tileX = 0; $tileX < $level['tiles_x']; $tileX++) {
@@ -547,5 +554,16 @@ class MinecraftMapTileService
     private function tileSize(): int
     {
         return 256;
+    }
+
+    /**
+     * @param  array<string, mixed>  $manifest
+     */
+    private function eagerMaxZoomForManifest(array $manifest): int
+    {
+        $nativeMaxZoom = (int) ($manifest['native_max_zoom'] ?? $manifest['max_zoom'] ?? 0);
+        $maxZoom = (int) ($manifest['max_zoom'] ?? $nativeMaxZoom);
+
+        return min($maxZoom, $nativeMaxZoom + self::EAGER_OVERZOOM_LEVELS);
     }
 }
