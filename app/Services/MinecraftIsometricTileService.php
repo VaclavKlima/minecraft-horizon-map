@@ -13,7 +13,7 @@ class MinecraftIsometricTileService
 
     private const OVERZOOM_LEVELS = 6;
 
-    private const EAGER_OVERZOOM_LEVELS = 2;
+    private const EAGER_OVERZOOM_LEVELS = 0;
 
     public function __construct(private Filesystem $files) {}
 
@@ -355,6 +355,12 @@ class MinecraftIsometricTileService
                 continue;
             }
 
+            $levelImage = $this->buildLevelImage($manifest, $sourceImage, $zoomLevel, $level);
+
+            if ($levelImage === false) {
+                continue;
+            }
+
             for ($tileY = 0; $tileY < $level['tiles_y']; $tileY++) {
                 for ($tileX = 0; $tileX < $level['tiles_x']; $tileX++) {
                     $path = $this->tilePath($regionFile, $zoomLevel, $tileX, $tileY);
@@ -363,12 +369,89 @@ class MinecraftIsometricTileService
                         continue;
                     }
 
-                    $this->generateTile($manifest, $regionFile, $zoomLevel, $tileX, $tileY, $path, $sourceImage);
+                    $this->generateTileFromLevelImage($levelImage, $level, $tileX, $tileY, $path);
                 }
+            }
+
+            if ($levelImage !== $sourceImage) {
+                imagedestroy($levelImage);
             }
         }
 
         imagedestroy($sourceImage);
+    }
+
+    /**
+     * @param  array<string, mixed>  $manifest
+     * @param  array<string, mixed>  $level
+     */
+    private function buildLevelImage(array $manifest, \GdImage $sourceImage, int $zoom, array $level): \GdImage|false
+    {
+        $nativeMaxZoom = $manifest['native_max_zoom'] ?? $manifest['max_zoom'];
+
+        if ($zoom === $nativeMaxZoom) {
+            return $sourceImage;
+        }
+
+        $levelWidth = max(1, (int) $level['width']);
+        $levelHeight = max(1, (int) $level['height']);
+        $sourceWidth = (int) $manifest['source_width'];
+        $sourceHeight = (int) $manifest['source_height'];
+        $levelImage = imagecreatetruecolor($levelWidth, $levelHeight);
+
+        if ($levelImage === false) {
+            return false;
+        }
+
+        imagealphablending($levelImage, false);
+        imagesavealpha($levelImage, true);
+        $transparent = imagecolorallocatealpha($levelImage, 0, 0, 0, 127);
+        imagefill($levelImage, 0, 0, $transparent);
+        imagecopyresampled(
+            $levelImage,
+            $sourceImage,
+            0,
+            0,
+            0,
+            0,
+            $levelWidth,
+            $levelHeight,
+            $sourceWidth,
+            $sourceHeight
+        );
+
+        return $levelImage;
+    }
+
+    /**
+     * @param  array<string, mixed>  $level
+     */
+    private function generateTileFromLevelImage(\GdImage $levelImage, array $level, int $tileX, int $tileY, string $path): void
+    {
+        $tileSize = $this->tileSize();
+        $tileImage = imagecreatetruecolor($tileSize, $tileSize);
+
+        if ($tileImage === false) {
+            throw new RuntimeException('Unable to allocate isometric tile image.');
+        }
+
+        imagealphablending($tileImage, false);
+        imagesavealpha($tileImage, true);
+        $transparent = imagecolorallocatealpha($tileImage, 0, 0, 0, 127);
+        imagefill($tileImage, 0, 0, $transparent);
+
+        $sourceX = $tileX * $tileSize;
+        $sourceY = $tileY * $tileSize;
+        $copyWidth = min($tileSize, max(0, ((int) $level['width']) - $sourceX));
+        $copyHeight = min($tileSize, max(0, ((int) $level['height']) - $sourceY));
+
+        if ($copyWidth > 0 && $copyHeight > 0) {
+            imagecopy($tileImage, $levelImage, 0, 0, $sourceX, $sourceY, $copyWidth, $copyHeight);
+        }
+
+        $this->safeEnsureDirectoryExists(dirname($path));
+        imagepng($tileImage, $path);
+        imagedestroy($tileImage);
     }
 
     /**

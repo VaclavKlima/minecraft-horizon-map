@@ -59,7 +59,7 @@ class MapInterfaceController extends Controller
 
         try {
             $tilePath = $projection === 'isometric'
-                ? $this->minecraftIsometricTileService->getTilePath($zoom, $x, $y, $region !== '' ? $region : null, false, false)
+                ? $this->minecraftIsometricTileService->getTilePath($zoom, $x, $y, $region !== '' ? $region : null, true, false)
                 : $this->minecraftMapTileService->getTilePath($zoom, $x, $y, $region !== '' ? $region : null);
         } catch (RuntimeException $exception) {
             abort(422, $exception->getMessage());

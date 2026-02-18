@@ -24,10 +24,12 @@ class RenderRegionIsometricImageJob implements ShouldQueue
             return;
         }
 
-        $region = $minecraftBirdsEyeRenderer->renderRegion($this->regionFile, $this->heightmapType);
+        if ($minecraftBirdsEyeRenderer->regionNeedsRendering($this->regionFile, $this->heightmapType)) {
+            $region = $minecraftBirdsEyeRenderer->renderRegion($this->regionFile, $this->heightmapType);
 
-        if ($region === null) {
-            return;
+            if ($region === null) {
+                return;
+            }
         }
 
         $minecraftIsometricRenderer->renderRegion($this->regionFile);

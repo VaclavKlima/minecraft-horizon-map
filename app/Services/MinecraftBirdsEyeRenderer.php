@@ -7,7 +7,7 @@ use RuntimeException;
 
 class MinecraftBirdsEyeRenderer
 {
-    private const RENDER_METADATA_VERSION = 2;
+    private const RENDER_METADATA_VERSION = 5;
 
     public function __construct(private Filesystem $files, private MinecraftRegionReader $minecraftRegionReader) {}
 
@@ -115,8 +115,18 @@ class MinecraftBirdsEyeRenderer
         $regionPath = public_path('region'.DIRECTORY_SEPARATOR.$regionFile);
         $renderPath = public_path('maps/regions'.DIRECTORY_SEPARATOR.str_replace('.mca', '.png', $regionFile));
         $metadataPath = $this->renderMetadataPath($regionFile);
+        $heightMapPath = $this->regionHeightMapPath($regionFile);
+        $surfaceMapPath = $this->regionSurfaceMaskPath($regionFile);
+        $voxelMapPath = $this->regionVoxelColorPath($regionFile);
 
-        if (! $this->files->exists($regionPath) || ! $this->files->exists($renderPath) || ! $this->files->exists($metadataPath)) {
+        if (
+            ! $this->files->exists($regionPath)
+            || ! $this->files->exists($renderPath)
+            || ! $this->files->exists($metadataPath)
+            || ! $this->files->exists($heightMapPath)
+            || ! $this->files->exists($surfaceMapPath)
+            || ! $this->files->exists($voxelMapPath)
+        ) {
             return true;
         }
 
@@ -187,6 +197,9 @@ class MinecraftBirdsEyeRenderer
                 'chunk_z' => $localChunkZ,
                 'heights' => $chunkData['heights'],
                 'colors' => $chunkData['colors'],
+                'thicknesses' => $chunkData['thicknesses'],
+                'surface_masks' => $chunkData['surface_masks'],
+                'voxel_colors' => $chunkData['voxel_colors'],
             ];
             $chunkMinHeight = min($chunkData['heights']);
             $chunkMaxHeight = max($chunkData['heights']);
@@ -251,6 +264,9 @@ class MinecraftBirdsEyeRenderer
         imagepng($image, $outputPath);
         imagedestroy($image);
         $this->writeRegionHeightMap($regionFile, $preparedChunks);
+        $this->writeRegionThicknessMap($regionFile, $preparedChunks);
+        $this->writeRegionSurfaceMaskMap($regionFile, $preparedChunks);
+        $this->writeRegionVoxelColorMap($regionFile, $preparedChunks);
 
         return [
             'region_file' => $regionFile,
@@ -408,6 +424,9 @@ class MinecraftBirdsEyeRenderer
      * @return array{
      *     heights: array<int, int>,
      *     colors: array<int, array{0:int,1:int,2:int}>,
+     *     thicknesses: array<int, int>,
+     *     surface_masks: array<int, int>,
+     *     voxel_colors: array<int, int>,
      *     chunk_x?: int,
      *     chunk_z?: int
      * }|null
@@ -485,11 +504,14 @@ class MinecraftBirdsEyeRenderer
             return null;
         }
 
-        [$heights, $colors] = $this->resolveTopSurface($sections, $heightmaps[$heightmapType] ?? null);
+        [$heights, $colors, $thicknesses, $surfaceMasks, $voxelColors] = $this->resolveTopSurface($sections, $heightmaps[$heightmapType] ?? null);
 
         return [
             'heights' => $heights,
             'colors' => $colors,
+            'thicknesses' => $thicknesses,
+            'surface_masks' => $surfaceMasks,
+            'voxel_colors' => $voxelColors,
             'chunk_x' => $chunkX,
             'chunk_z' => $chunkZ,
         ];
@@ -772,7 +794,7 @@ class MinecraftBirdsEyeRenderer
     /**
      * @param  array<int, array<string, mixed>>  $sections
      * @param  array<int, string>|null  $heightmap
-     * @return array{0: array<int, int>, 1: array<int, array{0:int,1:int,2:int}>}
+     * @return array{0: array<int, int>, 1: array<int, array{0:int,1:int,2:int}>, 2: array<int, int>, 3: array<int, int>, 4: array<int, int>}
      */
     private function resolveTopSurface(array $sections, ?array $heightmap): array
     {
@@ -784,6 +806,9 @@ class MinecraftBirdsEyeRenderer
         $maxY = ($maxSectionY * 16) + 15;
         $heights = array_fill(0, 256, 0);
         $colors = array_fill(0, 256, [90, 90, 92]);
+        $thicknesses = array_fill(0, 256, 0);
+        $surfaceMasks = array_fill(0, 256, 0);
+        $voxelColors = array_fill(0, 256 * 24, 0);
         $heightHints = $this->decodeHeightHints($heightmap, $minY, $maxY);
 
         for ($localZ = 0; $localZ < 16; $localZ++) {
@@ -814,6 +839,9 @@ class MinecraftBirdsEyeRenderer
 
                         $heights[$surfaceIndex] = ($sectionY * 16) + $localTopY + 1;
                         $colors[$surfaceIndex] = $section['palette_colors'][$paletteIndex] ?? [90, 90, 92];
+                        $thicknesses[$surfaceIndex] = $this->resolveColumnThickness($sections, $sectionY, $localTopY, $localX, $localZ);
+                        $surfaceMasks[$surfaceIndex] = $this->buildSurfaceMask($sections, $sectionY, $localTopY, $localX, $localZ);
+                        $this->writeColumnVoxelColors($voxelColors, $surfaceIndex, $this->resolveColumnVoxelColors($sections, $sectionY, $localTopY, $localX, $localZ));
                         break;
                     }
 
@@ -826,13 +854,135 @@ class MinecraftBirdsEyeRenderer
 
                         $heights[$surfaceIndex] = ($sectionY * 16) + $yInSection + 1;
                         $colors[$surfaceIndex] = $section['palette_colors'][$paletteIndex] ?? [90, 90, 92];
+                        $thicknesses[$surfaceIndex] = $this->resolveColumnThickness($sections, $sectionY, $yInSection, $localX, $localZ);
+                        $surfaceMasks[$surfaceIndex] = $this->buildSurfaceMask($sections, $sectionY, $yInSection, $localX, $localZ);
+                        $this->writeColumnVoxelColors($voxelColors, $surfaceIndex, $this->resolveColumnVoxelColors($sections, $sectionY, $yInSection, $localX, $localZ));
                         break 2;
                     }
                 }
             }
         }
 
-        return [$heights, $colors];
+        return [$heights, $colors, $thicknesses, $surfaceMasks, $voxelColors];
+    }
+
+    /**
+     * @param  array<int, array<string, mixed>>  $sections
+     */
+    private function resolveColumnThickness(array $sections, int $startSectionY, int $startYInSection, int $localX, int $localZ): int
+    {
+        $thickness = 0;
+        $sectionYs = array_keys($sections);
+        $minSectionY = (int) min($sectionYs);
+
+        for ($sectionY = $startSectionY; $sectionY >= $minSectionY; $sectionY--) {
+            if (! isset($sections[$sectionY])) {
+                break;
+            }
+
+            $section = $sections[$sectionY];
+            $startY = $sectionY === $startSectionY ? $startYInSection : 15;
+
+            for ($yInSection = $startY; $yInSection >= 0; $yInSection--) {
+                $paletteIndex = $this->paletteIndexAt($section, $localX, $localZ, $yInSection);
+
+                if (($section['palette_is_air'][$paletteIndex] ?? true) === true) {
+                    return $thickness;
+                }
+
+                $thickness++;
+
+                if ($thickness >= 255) {
+                    return 255;
+                }
+            }
+        }
+
+        return $thickness;
+    }
+
+    /**
+     * @param  array<int, array<string, mixed>>  $sections
+     */
+    private function buildSurfaceMask(array $sections, int $startSectionY, int $startYInSection, int $localX, int $localZ): int
+    {
+        $mask = 0;
+        $currentSectionY = $startSectionY;
+        $currentYInSection = $startYInSection;
+
+        for ($depth = 0; $depth < 24; $depth++) {
+            if (! isset($sections[$currentSectionY])) {
+                break;
+            }
+
+            $section = $sections[$currentSectionY];
+            $paletteIndex = $this->paletteIndexAt($section, $localX, $localZ, $currentYInSection);
+
+            if (($section['palette_is_air'][$paletteIndex] ?? true) === false) {
+                $mask |= (1 << $depth);
+            }
+
+            $currentYInSection--;
+
+            if ($currentYInSection < 0) {
+                $currentYInSection = 15;
+                $currentSectionY--;
+            }
+        }
+
+        return $mask;
+    }
+
+    /**
+     * @param  array<int, array<string, mixed>>  $sections
+     * @return array<int, int>
+     */
+    private function resolveColumnVoxelColors(array $sections, int $startSectionY, int $startYInSection, int $localX, int $localZ): array
+    {
+        $colors = array_fill(0, 24, 0);
+        $currentSectionY = $startSectionY;
+        $currentYInSection = $startYInSection;
+
+        for ($depth = 0; $depth < 24; $depth++) {
+            if (! isset($sections[$currentSectionY])) {
+                break;
+            }
+
+            $section = $sections[$currentSectionY];
+            $paletteIndex = $this->paletteIndexAt($section, $localX, $localZ, $currentYInSection);
+
+            if (($section['palette_is_air'][$paletteIndex] ?? true) === false) {
+                [$red, $green, $blue] = $section['palette_colors'][$paletteIndex] ?? [90, 90, 92];
+                $colors[$depth] = $this->packRgb($red, $green, $blue);
+            }
+
+            $currentYInSection--;
+
+            if ($currentYInSection < 0) {
+                $currentYInSection = 15;
+                $currentSectionY--;
+            }
+        }
+
+        return $colors;
+    }
+
+    /**
+     * @param  array<int, int>  $voxelColors
+     * @param  array<int, int>  $columnVoxelColors
+     */
+    private function writeColumnVoxelColors(array &$voxelColors, int $surfaceIndex, array $columnVoxelColors): void
+    {
+        $baseOffset = $surfaceIndex * 24;
+
+        for ($depth = 0; $depth < 24; $depth++) {
+            $voxelColors[$baseOffset + $depth] = $columnVoxelColors[$depth] ?? 0;
+        }
+    }
+
+    private function packRgb(int $red, int $green, int $blue): int
+    {
+        return (($red & 0xFF) << 16) | (($green & 0xFF) << 8) | ($blue & 0xFF);
     }
 
     /**
@@ -1321,7 +1471,15 @@ class MinecraftBirdsEyeRenderer
     }
 
     /**
-     * @param  array<int, array{chunk_x:int,chunk_z:int,heights:array<int, int>,colors:array<int, array{0:int,1:int,2:int}>}>  $preparedChunks
+     * @param  array<int, array{
+     *     chunk_x:int,
+     *     chunk_z:int,
+     *     heights:array<int, int>,
+     *     colors:array<int, array{0:int,1:int,2:int}>,
+     *     thicknesses:array<int, int>,
+     *     surface_masks:array<int, int>,
+     *     voxel_colors:array<int, int>
+     * }>  $preparedChunks
      */
     private function writeRegionHeightMap(string $regionFile, array $preparedChunks): void
     {
@@ -1360,5 +1518,157 @@ class MinecraftBirdsEyeRenderer
     private function regionHeightMapPath(string $regionFile): string
     {
         return public_path('maps/regions'.DIRECTORY_SEPARATOR.'.heights'.DIRECTORY_SEPARATOR.str_replace('.mca', '.png', $regionFile));
+    }
+
+    /**
+     * @param  array<int, array{
+     *     chunk_x:int,
+     *     chunk_z:int,
+     *     heights:array<int, int>,
+     *     colors:array<int, array{0:int,1:int,2:int}>,
+     *     thicknesses:array<int, int>,
+     *     surface_masks:array<int, int>,
+     *     voxel_colors:array<int, int>
+     * }>  $preparedChunks
+     */
+    private function writeRegionThicknessMap(string $regionFile, array $preparedChunks): void
+    {
+        $widthBlocks = 32 * 16;
+        $heightBlocks = 32 * 16;
+        $thicknessImage = imagecreatetruecolor($widthBlocks, $heightBlocks);
+
+        if ($thicknessImage === false) {
+            throw new RuntimeException('Unable to allocate region thickness map image.');
+        }
+
+        foreach ($preparedChunks as $chunk) {
+            $basePixelX = $chunk['chunk_x'] * 16;
+            $basePixelZ = $chunk['chunk_z'] * 16;
+            $thicknesses = $chunk['thicknesses'];
+
+            for ($localZ = 0; $localZ < 16; $localZ++) {
+                for ($localX = 0; $localX < 16; $localX++) {
+                    $index = ($localZ * 16) + $localX;
+                    $value = max(0, min(255, $thicknesses[$index]));
+                    $color = ($value << 16) | ($value << 8) | $value;
+                    imagesetpixel($thicknessImage, $basePixelX + $localX, $basePixelZ + $localZ, $color);
+                }
+            }
+        }
+
+        $path = $this->regionThicknessMapPath($regionFile);
+        $this->files->ensureDirectoryExists(dirname($path));
+        imagepng($thicknessImage, $path);
+        imagedestroy($thicknessImage);
+    }
+
+    private function regionThicknessMapPath(string $regionFile): string
+    {
+        return public_path('maps/regions'.DIRECTORY_SEPARATOR.'.thickness'.DIRECTORY_SEPARATOR.str_replace('.mca', '.png', $regionFile));
+    }
+
+    /**
+     * @param  array<int, array{
+     *     chunk_x:int,
+     *     chunk_z:int,
+     *     heights:array<int, int>,
+     *     colors:array<int, array{0:int,1:int,2:int}>,
+     *     thicknesses:array<int, int>,
+     *     surface_masks:array<int, int>,
+     *     voxel_colors:array<int, int>
+     * }>  $preparedChunks
+     */
+    private function writeRegionSurfaceMaskMap(string $regionFile, array $preparedChunks): void
+    {
+        $widthBlocks = 32 * 16;
+        $heightBlocks = 32 * 16;
+        $surfaceImage = imagecreatetruecolor($widthBlocks, $heightBlocks);
+
+        if ($surfaceImage === false) {
+            throw new RuntimeException('Unable to allocate region surface mask image.');
+        }
+
+        foreach ($preparedChunks as $chunk) {
+            $basePixelX = $chunk['chunk_x'] * 16;
+            $basePixelZ = $chunk['chunk_z'] * 16;
+            $masks = $chunk['surface_masks'];
+
+            for ($localZ = 0; $localZ < 16; $localZ++) {
+                for ($localX = 0; $localX < 16; $localX++) {
+                    $index = ($localZ * 16) + $localX;
+                    $mask = $masks[$index];
+                    $red = ($mask >> 16) & 0xFF;
+                    $green = ($mask >> 8) & 0xFF;
+                    $blue = $mask & 0xFF;
+                    $color = ($red << 16) | ($green << 8) | $blue;
+                    imagesetpixel($surfaceImage, $basePixelX + $localX, $basePixelZ + $localZ, $color);
+                }
+            }
+        }
+
+        $path = $this->regionSurfaceMaskPath($regionFile);
+        $this->files->ensureDirectoryExists(dirname($path));
+        imagepng($surfaceImage, $path);
+        imagedestroy($surfaceImage);
+    }
+
+    private function regionSurfaceMaskPath(string $regionFile): string
+    {
+        return public_path('maps/regions'.DIRECTORY_SEPARATOR.'.surface'.DIRECTORY_SEPARATOR.str_replace('.mca', '.png', $regionFile));
+    }
+
+    /**
+     * @param  array<int, array{
+     *     chunk_x:int,
+     *     chunk_z:int,
+     *     heights:array<int, int>,
+     *     colors:array<int, array{0:int,1:int,2:int}>,
+     *     thicknesses:array<int, int>,
+     *     surface_masks:array<int, int>,
+     *     voxel_colors:array<int, int>
+     * }>  $preparedChunks
+     */
+    private function writeRegionVoxelColorMap(string $regionFile, array $preparedChunks): void
+    {
+        $widthBlocks = 32 * 16;
+        $heightBlocks = 32 * 16;
+        $layers = 24;
+        $bytesPerVoxel = 3;
+        $bufferSize = $widthBlocks * $heightBlocks * $layers * $bytesPerVoxel;
+        $buffer = str_repeat("\0", $bufferSize);
+
+        foreach ($preparedChunks as $chunk) {
+            $basePixelX = $chunk['chunk_x'] * 16;
+            $basePixelZ = $chunk['chunk_z'] * 16;
+            $voxelColors = $chunk['voxel_colors'];
+
+            for ($localZ = 0; $localZ < 16; $localZ++) {
+                for ($localX = 0; $localX < 16; $localX++) {
+                    $surfaceIndex = ($localZ * 16) + $localX;
+                    $globalX = $basePixelX + $localX;
+                    $globalZ = $basePixelZ + $localZ;
+                    $pixelIndex = ($globalZ * $widthBlocks) + $globalX;
+                    $columnOffset = $surfaceIndex * $layers;
+                    $bufferOffset = $pixelIndex * $layers * $bytesPerVoxel;
+
+                    for ($depth = 0; $depth < $layers; $depth++) {
+                        $packedColor = $voxelColors[$columnOffset + $depth] ?? 0;
+                        $writeOffset = $bufferOffset + ($depth * $bytesPerVoxel);
+                        $buffer[$writeOffset] = chr(($packedColor >> 16) & 0xFF);
+                        $buffer[$writeOffset + 1] = chr(($packedColor >> 8) & 0xFF);
+                        $buffer[$writeOffset + 2] = chr($packedColor & 0xFF);
+                    }
+                }
+            }
+        }
+
+        $path = $this->regionVoxelColorPath($regionFile);
+        $this->files->ensureDirectoryExists(dirname($path));
+        $this->files->put($path, $buffer);
+    }
+
+    private function regionVoxelColorPath(string $regionFile): string
+    {
+        return public_path('maps/regions'.DIRECTORY_SEPARATOR.'.voxels'.DIRECTORY_SEPARATOR.str_replace('.mca', '.bin', $regionFile));
     }
 }
