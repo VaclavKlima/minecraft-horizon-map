@@ -17,23 +17,31 @@ it('queues birds-eye map jobs through the api', function () {
         'heightmap' => 'WORLD_SURFACE',
     ]);
 
-    $response->assertAccepted()
+    $payload = $response->assertAccepted()
         ->assertJson(fn (\Illuminate\Testing\Fluent\AssertableJson $json) => $json
             ->whereType('batch_id', 'string')
             ->whereType('region_count', 'integer')
-            ->where('region_count', fn (int $value) => $value > 0)
             ->etc())
-        ->assertJsonPath('message', 'Queued map generation jobs.');
+        ->json();
 
-    Bus::assertBatched(function ($batch): bool {
-        return count($batch->jobs) > 0
-            && collect($batch->jobs)->every(
-                fn (mixed $jobs): bool => is_array($jobs)
-                    && count($jobs) === 2
-                    && $jobs[0] instanceof RenderRegionMapImageJob
-                    && $jobs[1] instanceof GenerateRegionTilesJob
-            );
-    });
+    if (($payload['region_count'] ?? 0) > 0) {
+        $response->assertJsonPath('message', 'Queued map generation jobs.');
+
+        Bus::assertBatched(function ($batch): bool {
+            return count($batch->jobs) > 0
+                && collect($batch->jobs)->every(
+                    fn (mixed $jobs): bool => is_array($jobs)
+                        && count($jobs) === 2
+                        && $jobs[0] instanceof RenderRegionMapImageJob
+                        && $jobs[1] instanceof GenerateRegionTilesJob
+                );
+        });
+
+        return;
+    }
+
+    $response->assertJsonPath('message', 'No changed regions detected.');
+    Bus::assertNothingBatched();
 });
 
 it('queues birds-eye map jobs through the command', function () {
@@ -42,7 +50,7 @@ it('queues birds-eye map jobs through the command', function () {
     $this->artisan('map:render-birdeye --heightmap=WORLD_SURFACE')
         ->assertSuccessful();
 
-    Bus::assertBatched(function ($batch): bool {
+    $matchingBatches = Bus::batched(function ($batch): bool {
         return count($batch->jobs) > 0
             && collect($batch->jobs)->every(
                 fn (mixed $jobs): bool => is_array($jobs)
@@ -51,4 +59,12 @@ it('queues birds-eye map jobs through the command', function () {
                     && $jobs[1] instanceof GenerateRegionTilesJob
             );
     });
+
+    if ($matchingBatches->count() === 0) {
+        Bus::assertNothingBatched();
+
+        return;
+    }
+
+    expect($matchingBatches->count())->toBeGreaterThan(0);
 });

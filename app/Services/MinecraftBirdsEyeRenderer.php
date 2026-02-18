@@ -7,7 +7,7 @@ use RuntimeException;
 
 class MinecraftBirdsEyeRenderer
 {
-    private const RENDER_METADATA_VERSION = 1;
+    private const RENDER_METADATA_VERSION = 2;
 
     public function __construct(private Filesystem $files, private MinecraftRegionReader $minecraftRegionReader) {}
 
@@ -237,7 +237,7 @@ class MinecraftBirdsEyeRenderer
                     $shadedRed = max(0, min(255, (int) round($red * $shadeFactor)));
                     $shadedGreen = max(0, min(255, (int) round($green * $shadeFactor)));
                     $shadedBlue = max(0, min(255, (int) round($blue * $shadeFactor)));
-                    $colorKey = $shadedRed.'-'.$shadedGreen.'-'.$shadedBlue;
+                    $colorKey = ($shadedRed << 16) | ($shadedGreen << 8) | $shadedBlue;
 
                     if (! array_key_exists($colorKey, $colorCache)) {
                         $colorCache[$colorKey] = imagecolorallocate($image, $shadedRed, $shadedGreen, $shadedBlue);
@@ -250,6 +250,7 @@ class MinecraftBirdsEyeRenderer
 
         imagepng($image, $outputPath);
         imagedestroy($image);
+        $this->writeRegionHeightMap($regionFile, $preparedChunks);
 
         return [
             'region_file' => $regionFile,
@@ -379,7 +380,7 @@ class MinecraftBirdsEyeRenderer
                 $r = max(0, min(255, (int) round($red * $shadeFactor)));
                 $g = max(0, min(255, (int) round($green * $shadeFactor)));
                 $b = max(0, min(255, (int) round($blue * $shadeFactor)));
-                $key = $r.'-'.$g.'-'.$b;
+                $key = ($r << 16) | ($g << 8) | $b;
 
                 if (! array_key_exists($key, $cache)) {
                     $cache[$key] = imagecolorallocate($image, $r, $g, $b);
@@ -595,6 +596,9 @@ class MinecraftBirdsEyeRenderer
 
             $sections[$section['y']] = [
                 'palette' => $section['palette'],
+                'palette_is_air' => $section['palette_is_air'],
+                'palette_colors' => $section['palette_colors'],
+                'uniform_palette_index' => $section['uniform_palette_index'],
                 'block_data_words' => $section['block_data_words'],
                 'bits_per_entry' => $section['bits_per_entry'],
                 'values_per_long' => $section['values_per_long'],
@@ -609,6 +613,9 @@ class MinecraftBirdsEyeRenderer
      * @return array{
      *     y:int,
      *     palette: array<int, string>,
+     *     palette_is_air: array<int, bool>,
+     *     palette_colors: array<int, array{0:int,1:int,2:int}>,
+     *     uniform_palette_index:?int,
      *     block_data_words: array<int, array{hi:int,lo:int}>,
      *     bits_per_entry:?int,
      *     values_per_long:?int,
@@ -649,12 +656,23 @@ class MinecraftBirdsEyeRenderer
             return null;
         }
 
+        $paletteIsAir = [];
+        $paletteColors = [];
+
+        foreach ($palette as $index => $blockName) {
+            $paletteIsAir[$index] = $this->isAirLikeBlock($blockName);
+            $paletteColors[$index] = $this->colorForBlock($blockName);
+        }
+
         $bitsPerEntry = null;
         $valuesPerLong = null;
         $usesPaddedLayout = false;
         $blockDataWords = [];
+        $uniformPaletteIndex = null;
 
-        if (count($palette) > 1 && $blockData !== []) {
+        if (count($palette) === 1) {
+            $uniformPaletteIndex = 0;
+        } elseif ($blockData !== []) {
             $bitsPerEntry = max(4, (int) ceil(log(count($palette), 2)));
             $valuesPerLong = intdiv(64, $bitsPerEntry);
             $blockDataWords = $this->unpackLongWords($blockData);
@@ -664,6 +682,9 @@ class MinecraftBirdsEyeRenderer
         return [
             'y' => $sectionY,
             'palette' => $palette,
+            'palette_is_air' => $paletteIsAir,
+            'palette_colors' => $paletteColors,
+            'uniform_palette_index' => $uniformPaletteIndex,
             'block_data_words' => $blockDataWords,
             'bits_per_entry' => $bitsPerEntry,
             'values_per_long' => $valuesPerLong,
@@ -757,8 +778,10 @@ class MinecraftBirdsEyeRenderer
     {
         $sectionYs = array_keys($sections);
         sort($sectionYs);
-        $minY = ((int) min($sectionYs)) * 16;
-        $maxY = (((int) max($sectionYs)) * 16) + 15;
+        $minSectionY = (int) min($sectionYs);
+        $maxSectionY = (int) max($sectionYs);
+        $minY = $minSectionY * 16;
+        $maxY = ($maxSectionY * 16) + 15;
         $heights = array_fill(0, 256, 0);
         $colors = array_fill(0, 256, [90, 90, 92]);
         $heightHints = $this->decodeHeightHints($heightmap, $minY, $maxY);
@@ -767,20 +790,43 @@ class MinecraftBirdsEyeRenderer
             for ($localX = 0; $localX < 16; $localX++) {
                 $surfaceIndex = ($localZ * 16) + $localX;
                 $startY = $heightHints[$surfaceIndex] ?? $maxY;
+                $startSectionY = $this->floorDivide($startY, 16);
+                $startSectionY = max($minSectionY, min($maxSectionY, $startSectionY));
 
-                for ($y = $startY; $y >= $minY; $y--) {
-                    $sectionY = $this->floorDivide($y, 16);
-
-                    if (! array_key_exists($sectionY, $sections)) {
+                for ($sectionY = $startSectionY; $sectionY >= $minSectionY; $sectionY--) {
+                    if (! isset($sections[$sectionY])) {
                         continue;
                     }
 
-                    $blockName = $this->blockNameAtY($sections[$sectionY], $localX, $localZ, $y);
+                    $section = $sections[$sectionY];
+                    $localTopY = $sectionY === $startSectionY ? ($startY - ($sectionY * 16)) : 15;
 
-                    if (! $this->isAirLikeBlock($blockName)) {
-                        $heights[$surfaceIndex] = $y + 1;
-                        $colors[$surfaceIndex] = $this->colorForBlock($blockName);
+                    if ($localTopY < 0) {
+                        continue;
+                    }
+
+                    if ($section['uniform_palette_index'] !== null) {
+                        $paletteIndex = (int) $section['uniform_palette_index'];
+
+                        if (($section['palette_is_air'][$paletteIndex] ?? true) === true) {
+                            continue;
+                        }
+
+                        $heights[$surfaceIndex] = ($sectionY * 16) + $localTopY + 1;
+                        $colors[$surfaceIndex] = $section['palette_colors'][$paletteIndex] ?? [90, 90, 92];
                         break;
+                    }
+
+                    for ($yInSection = $localTopY; $yInSection >= 0; $yInSection--) {
+                        $paletteIndex = $this->paletteIndexAt($section, $localX, $localZ, $yInSection);
+
+                        if (($section['palette_is_air'][$paletteIndex] ?? true) === true) {
+                            continue;
+                        }
+
+                        $heights[$surfaceIndex] = ($sectionY * 16) + $yInSection + 1;
+                        $colors[$surfaceIndex] = $section['palette_colors'][$paletteIndex] ?? [90, 90, 92];
+                        break 2;
                     }
                 }
             }
@@ -825,28 +871,20 @@ class MinecraftBirdsEyeRenderer
 
     /**
      * @param  array{
-     *     palette: array<int, string>,
      *     block_data_words: array<int, array{hi:int,lo:int}>,
      *     bits_per_entry:?int,
      *     values_per_long:?int,
      *     uses_padded_layout:bool
      * }  $section
      */
-    private function blockNameAtY(array $section, int $localX, int $localZ, int $worldY): string
+    private function paletteIndexAt(array $section, int $localX, int $localZ, int $yInSection): int
     {
-        $yInSection = (($worldY % 16) + 16) % 16;
         $blockIndex = ($yInSection * 256) + ($localZ * 16) + $localX;
-        $paletteIndex = 0;
-
-        if ($section['bits_per_entry'] !== null && $section['block_data_words'] !== []) {
-            $paletteIndex = $this->readPackedIndexForBlock($section, $blockIndex);
+        if ($section['bits_per_entry'] === null || $section['block_data_words'] === []) {
+            return 0;
         }
 
-        if (! isset($section['palette'][$paletteIndex])) {
-            return 'minecraft:air';
-        }
-
-        return $section['palette'][$paletteIndex];
+        return $this->readPackedIndexForBlock($section, $blockIndex);
     }
 
     /**
@@ -1280,5 +1318,47 @@ class MinecraftBirdsEyeRenderer
     private function renderMetadataPath(string $regionFile): string
     {
         return public_path('maps/regions'.DIRECTORY_SEPARATOR.'.meta'.DIRECTORY_SEPARATOR.str_replace('.mca', '.json', $regionFile));
+    }
+
+    /**
+     * @param  array<int, array{chunk_x:int,chunk_z:int,heights:array<int, int>,colors:array<int, array{0:int,1:int,2:int}>}>  $preparedChunks
+     */
+    private function writeRegionHeightMap(string $regionFile, array $preparedChunks): void
+    {
+        $widthBlocks = 32 * 16;
+        $heightBlocks = 32 * 16;
+        $heightImage = imagecreatetruecolor($widthBlocks, $heightBlocks);
+
+        if ($heightImage === false) {
+            throw new RuntimeException('Unable to allocate region height map image.');
+        }
+
+        foreach ($preparedChunks as $chunk) {
+            $basePixelX = $chunk['chunk_x'] * 16;
+            $basePixelZ = $chunk['chunk_z'] * 16;
+            $heights = $chunk['heights'];
+
+            for ($localZ = 0; $localZ < 16; $localZ++) {
+                for ($localX = 0; $localX < 16; $localX++) {
+                    $index = ($localZ * 16) + $localX;
+                    $heightValue = $heights[$index];
+                    $encodedHeight = $heightValue + 32768;
+                    $red = ($encodedHeight >> 8) & 0xFF;
+                    $green = $encodedHeight & 0xFF;
+                    $color = ($red << 16) | ($green << 8);
+                    imagesetpixel($heightImage, $basePixelX + $localX, $basePixelZ + $localZ, $color);
+                }
+            }
+        }
+
+        $heightMapPath = $this->regionHeightMapPath($regionFile);
+        $this->files->ensureDirectoryExists(dirname($heightMapPath));
+        imagepng($heightImage, $heightMapPath);
+        imagedestroy($heightImage);
+    }
+
+    private function regionHeightMapPath(string $regionFile): string
+    {
+        return public_path('maps/regions'.DIRECTORY_SEPARATOR.'.heights'.DIRECTORY_SEPARATOR.str_replace('.mca', '.png', $regionFile));
     }
 }

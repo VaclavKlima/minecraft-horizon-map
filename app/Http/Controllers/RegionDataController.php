@@ -5,6 +5,7 @@ namespace App\Http\Controllers;
 use App\Http\Requests\ReadRegionRequest;
 use App\Http\Requests\RenderBirdsEyeMapRequest;
 use App\Services\DispatchBirdsEyeMapBatch;
+use App\Services\DispatchIsometricMapBatch;
 use App\Services\MinecraftRegionReader;
 use Illuminate\Http\JsonResponse;
 use InvalidArgumentException;
@@ -14,7 +15,8 @@ class RegionDataController extends Controller
 {
     public function __construct(
         private MinecraftRegionReader $minecraftRegionReader,
-        private DispatchBirdsEyeMapBatch $dispatchBirdsEyeMapBatch
+        private DispatchBirdsEyeMapBatch $dispatchBirdsEyeMapBatch,
+        private DispatchIsometricMapBatch $dispatchIsometricMapBatch
     ) {}
 
     public function index(): JsonResponse
@@ -45,6 +47,21 @@ class RegionDataController extends Controller
     {
         try {
             $result = $this->dispatchBirdsEyeMapBatch->dispatch(
+                $request->string('heightmap', 'WORLD_SURFACE')->toString()
+            );
+
+            return response()->json($result, 202);
+        } catch (RuntimeException $exception) {
+            return response()->json([
+                'message' => $exception->getMessage(),
+            ], 422);
+        }
+    }
+
+    public function renderIsometric(RenderBirdsEyeMapRequest $request): JsonResponse
+    {
+        try {
+            $result = $this->dispatchIsometricMapBatch->dispatch(
                 $request->string('heightmap', 'WORLD_SURFACE')->toString()
             );
 

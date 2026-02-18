@@ -12,6 +12,7 @@ Route::get('/api/regions', [RegionDataController::class, 'index']);
 Route::get('/api/regions/{regionFile}', [RegionDataController::class, 'show'])
     ->where('regionFile', 'r\.-?\d+\.-?\d+\.mca');
 Route::post('/api/maps/birdeye/render', [RegionDataController::class, 'renderBirdsEye']);
+Route::post('/api/maps/isometric/render', [RegionDataController::class, 'renderIsometric']);
 Route::get('/api/maps/manifest', [MapInterfaceController::class, 'manifest']);
 Route::get('/api/maps/tiles/{zoom}/{x}/{y}.png', [MapInterfaceController::class, 'tile'])
     ->whereNumber('zoom')

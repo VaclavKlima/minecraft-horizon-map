@@ -25,6 +25,14 @@
 
                     <div class="flex items-center gap-2">
                         <select
+                            id="projection-select"
+                            class="rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-slate-100 focus:border-emerald-500 focus:outline-none"
+                        >
+                            <option value="birds-eye">Birds-eye</option>
+                            <option value="isometric">Isometric</option>
+                        </select>
+
+                        <select
                             id="region-select"
                             class="rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-slate-100 focus:border-emerald-500 focus:outline-none"
                         >
@@ -69,6 +77,7 @@
             const tilesEl = document.getElementById('map-tiles');
             const renderButton = document.getElementById('render-map');
             const regionSelect = document.getElementById('region-select');
+            const projectionSelect = document.getElementById('projection-select');
 
             let manifest = null;
             let zoom = 0;
@@ -81,11 +90,68 @@
             let dragOriginY = 0;
             let activeTiles = new Map();
             let selectedRegion = null;
+            let selectedProjection = 'birds-eye';
+            let requestedViewState = null;
+            let urlSyncTimeout = null;
+            let tileRetryTimer = null;
 
             const tileSize = 256;
+            const urlParams = new URLSearchParams(window.location.search);
+
+            if (urlParams.get('projection') === 'isometric') {
+                selectedProjection = 'isometric';
+            }
+
+            const requestedRegion = urlParams.get('region');
+            if (requestedRegion !== null && requestedRegion !== '') {
+                selectedRegion = requestedRegion;
+            }
+
+            const requestedZoom = Number.parseInt(urlParams.get('zoom') ?? '', 10);
+            const requestedOffsetX = Number.parseInt(urlParams.get('x') ?? '', 10);
+            const requestedOffsetY = Number.parseInt(urlParams.get('y') ?? '', 10);
+            if (
+                Number.isInteger(requestedZoom)
+                && Number.isInteger(requestedOffsetX)
+                && Number.isInteger(requestedOffsetY)
+            ) {
+                requestedViewState = {
+                    zoom: requestedZoom,
+                    x: requestedOffsetX,
+                    y: requestedOffsetY,
+                };
+            }
+
+            projectionSelect.value = selectedProjection;
 
             function levelInfo(level) {
                 return manifest.levels[String(level)];
+            }
+
+            function updateUrlState() {
+                const params = new URLSearchParams();
+                params.set('projection', selectedProjection);
+
+                if (selectedRegion) {
+                    params.set('region', selectedRegion);
+                }
+
+                if (manifest) {
+                    params.set('zoom', String(zoom));
+                    params.set('x', String(Math.round(offsetX)));
+                    params.set('y', String(Math.round(offsetY)));
+                }
+
+                const nextUrl = `${window.location.pathname}?${params.toString()}`;
+                window.history.replaceState({}, '', nextUrl);
+            }
+
+            function scheduleUrlStateSync() {
+                if (urlSyncTimeout !== null) {
+                    window.clearTimeout(urlSyncTimeout);
+                }
+
+                urlSyncTimeout = window.setTimeout(updateUrlState, 80);
             }
 
             function mapDivisor(level) {
@@ -107,11 +173,26 @@
                 statusEl.textContent = message;
             }
 
-            function tileUrl(level, x, y) {
-                const query = selectedRegion ? `?region=${encodeURIComponent(selectedRegion)}` : '';
-                const version = manifest?.generated_at ? `${query ? '&' : '?'}t=${encodeURIComponent(String(manifest.generated_at))}` : '';
+            function buildQueryString(includeRegion = true) {
+                const params = new URLSearchParams();
 
-                return `/api/maps/tiles/${level}/${x}/${y}.png${query}${version}`;
+                if (includeRegion && selectedRegion) {
+                    params.set('region', selectedRegion);
+                }
+
+                params.set('projection', selectedProjection);
+
+                return params.toString();
+            }
+
+            function tileUrl(level, x, y) {
+                const params = new URLSearchParams(buildQueryString(true));
+
+                if (manifest?.generated_at) {
+                    params.set('t', String(manifest.generated_at));
+                }
+
+                return `/api/maps/tiles/${level}/${x}/${y}.png?${params.toString()}`;
             }
 
             function renderTiles() {
@@ -137,6 +218,20 @@
                             const img = new Image();
                             img.draggable = false;
                             img.src = tileUrl(zoom, tileX, tileY);
+                            img.onerror = () => {
+                                if (selectedProjection !== 'isometric') {
+                                    return;
+                                }
+
+                                if (tileRetryTimer !== null) {
+                                    return;
+                                }
+
+                                tileRetryTimer = window.setTimeout(() => {
+                                    tileRetryTimer = null;
+                                    renderTiles();
+                                }, 650);
+                            };
                             img.className = 'absolute h-64 w-64 select-none';
                             activeTiles.set(key, img);
                             tileLayer.appendChild(img);
@@ -157,6 +252,7 @@
 
                 zoomEl.textContent = `${zoom} / ${manifest.max_zoom}`;
                 tilesEl.textContent = `${info.tiles_x} x ${info.tiles_y}`;
+                scheduleUrlStateSync();
             }
 
             function renderRegionOptions() {
@@ -177,15 +273,21 @@
             function fitInitialPosition() {
                 const viewportWidth = viewport.clientWidth;
                 const viewportHeight = viewport.clientHeight;
-                let candidate = manifest.max_zoom;
+                if (requestedViewState && requestedViewState.zoom >= 0 && requestedViewState.zoom <= manifest.max_zoom) {
+                    zoom = requestedViewState.zoom;
+                    offsetX = requestedViewState.x;
+                    offsetY = requestedViewState.y;
+                    requestedViewState = null;
+                    clampOffsets();
+                    return;
+                }
 
+                let candidate = manifest.max_zoom;
                 while (candidate > 0) {
                     const info = levelInfo(candidate);
-
                     if (info.width <= viewportWidth * 1.4 && info.height <= viewportHeight * 1.4) {
                         break;
                     }
-
                     candidate--;
                 }
 
@@ -220,18 +322,20 @@
 
             async function loadManifest(region = selectedRegion) {
                 setStatus('Loading map manifest...');
-                const query = region ? `?region=${encodeURIComponent(region)}` : '';
-                const response = await fetch(`/api/maps/manifest${query}`);
+                selectedRegion = region || null;
+                const query = buildQueryString(true);
+                const response = await fetch(`/api/maps/manifest?${query}`);
                 const payload = await response.json();
 
                 if (!payload.available) {
                     manifest = null;
                     selectedRegion = null;
-                    regionSelect.innerHTML = '<option value="all">All regions</option>';
+                    regionSelect.innerHTML = '<option value="">No regions</option>';
                     regionSelect.disabled = true;
                     activeTiles.forEach(tile => tile.remove());
                     activeTiles.clear();
                     setStatus(payload.message ?? 'Map not available.');
+                    scheduleUrlStateSync();
                     return;
                 }
 
@@ -240,7 +344,8 @@
                 renderRegionOptions();
                 fitInitialPosition();
                 renderTiles();
-                setStatus(`Map loaded (${selectedRegion}): ${manifest.source_width} x ${manifest.source_height} blocks`);
+                setStatus(`Map loaded (${selectedProjection}, ${selectedRegion}): ${manifest.source_width} x ${manifest.source_height} blocks`);
+                scheduleUrlStateSync();
             }
 
             async function renderWorldMap() {
@@ -249,7 +354,10 @@
 
                 try {
                     const token = document.querySelector('meta[name="csrf-token"]').content;
-                    const response = await fetch('/api/maps/birdeye/render', {
+                    const endpoint = selectedProjection === 'isometric'
+                        ? '/api/maps/isometric/render'
+                        : '/api/maps/birdeye/render';
+                    const response = await fetch(endpoint, {
                         method: 'POST',
                         headers: {
                             'Content-Type': 'application/json',
@@ -268,7 +376,7 @@
                     const queuedRegions = payload.region_count ?? 0;
                     const batchId = payload.batch_id ?? 'unknown';
 
-                    setStatus(`Queued ${queuedRegions} region jobs (batch ${batchId}). Tiles will appear as jobs finish.`);
+                    setStatus(`Queued ${queuedRegions} ${selectedProjection} region jobs (batch ${batchId}). Tiles will appear as jobs finish.`);
                     window.setTimeout(() => {
                         loadManifest(selectedRegion).catch(error => setStatus(error.message));
                     }, 1500);
@@ -329,10 +437,20 @@
 
             renderButton.addEventListener('click', renderWorldMap);
             regionSelect.addEventListener('change', () => {
-                selectedRegion = regionSelect.value || 'all';
+                selectedRegion = regionSelect.value || null;
                 activeTiles.forEach(tile => tile.remove());
                 activeTiles.clear();
+                scheduleUrlStateSync();
                 loadManifest(selectedRegion).catch(error => setStatus(error.message));
+            });
+
+            projectionSelect.addEventListener('change', () => {
+                selectedProjection = projectionSelect.value || 'birds-eye';
+                selectedRegion = null;
+                activeTiles.forEach(tile => tile.remove());
+                activeTiles.clear();
+                scheduleUrlStateSync();
+                loadManifest(null).catch(error => setStatus(error.message));
             });
 
             loadManifest().catch(error => setStatus(error.message));

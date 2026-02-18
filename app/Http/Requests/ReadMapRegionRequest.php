@@ -23,6 +23,7 @@ class ReadMapRegionRequest extends FormRequest
     {
         return [
             'region' => ['nullable', 'string', 'regex:/^(all|r\.-?\d+\.-?\d+\.mca)$/'],
+            'projection' => ['nullable', 'string', 'in:birds-eye,isometric'],
         ];
     }
 
@@ -33,6 +34,7 @@ class ReadMapRegionRequest extends FormRequest
     {
         return [
             'region.regex' => 'Region must be "all" or match r.<x>.<z>.mca.',
+            'projection.in' => 'Projection must be "birds-eye" or "isometric".',
         ];
     }
 }
