@@ -552,7 +552,10 @@ class MinecraftBirdsEyeRenderer
 
             $sections[$section['y']] = [
                 'palette' => $section['palette'],
-                'indices' => $section['indices'],
+                'block_data_words' => $section['block_data_words'],
+                'bits_per_entry' => $section['bits_per_entry'],
+                'values_per_long' => $section['values_per_long'],
+                'uses_padded_layout' => $section['uses_padded_layout'],
             ];
         }
 
@@ -560,7 +563,14 @@ class MinecraftBirdsEyeRenderer
     }
 
     /**
-     * @return array{y:int, palette: array<int, string>, indices: array<int, int>|null}|null
+     * @return array{
+     *     y:int,
+     *     palette: array<int, string>,
+     *     block_data_words: array<int, array{hi:int,lo:int}>,
+     *     bits_per_entry:?int,
+     *     values_per_long:?int,
+     *     uses_padded_layout:bool
+     * }|null
      */
     private function readSectionCompound(string $binary, int &$cursor): ?array
     {
@@ -596,17 +606,25 @@ class MinecraftBirdsEyeRenderer
             return null;
         }
 
-        $indices = null;
+        $bitsPerEntry = null;
+        $valuesPerLong = null;
+        $usesPaddedLayout = false;
+        $blockDataWords = [];
 
         if (count($palette) > 1 && $blockData !== []) {
             $bitsPerEntry = max(4, (int) ceil(log(count($palette), 2)));
-            $indices = $this->decodePackedValues($blockData, 4096, $bitsPerEntry);
+            $valuesPerLong = intdiv(64, $bitsPerEntry);
+            $blockDataWords = $this->unpackLongWords($blockData);
+            $usesPaddedLayout = $valuesPerLong > 0 && (count($blockDataWords) * $valuesPerLong) >= 4096;
         }
 
         return [
             'y' => $sectionY,
             'palette' => $palette,
-            'indices' => $indices,
+            'block_data_words' => $blockDataWords,
+            'bits_per_entry' => $bitsPerEntry,
+            'values_per_long' => $valuesPerLong,
+            'uses_padded_layout' => $usesPaddedLayout,
         ];
     }
 
@@ -763,13 +781,23 @@ class MinecraftBirdsEyeRenderer
     }
 
     /**
-     * @param  array{palette: array<int, string>, indices: array<int, int>|null}  $section
+     * @param  array{
+     *     palette: array<int, string>,
+     *     block_data_words: array<int, array{hi:int,lo:int}>,
+     *     bits_per_entry:?int,
+     *     values_per_long:?int,
+     *     uses_padded_layout:bool
+     * }  $section
      */
     private function blockNameAtY(array $section, int $localX, int $localZ, int $worldY): string
     {
         $yInSection = (($worldY % 16) + 16) % 16;
         $blockIndex = ($yInSection * 256) + ($localZ * 16) + $localX;
-        $paletteIndex = $section['indices'][$blockIndex] ?? 0;
+        $paletteIndex = 0;
+
+        if ($section['bits_per_entry'] !== null && $section['block_data_words'] !== []) {
+            $paletteIndex = $this->readPackedIndexForBlock($section, $blockIndex);
+        }
 
         if (! isset($section['palette'][$paletteIndex])) {
             return 'minecraft:air';
@@ -1002,73 +1030,154 @@ class MinecraftBirdsEyeRenderer
             $bitsPerEntry = max(1, intdiv(count($longBytes) * 64, $entryCount));
         }
 
+        $longWords = $this->unpackLongWords($longBytes);
         $valuesPerLong = intdiv(64, $bitsPerEntry);
 
-        if ($valuesPerLong > 0 && (count($longBytes) * $valuesPerLong) >= $entryCount) {
-            return $this->decodePaddedPackedValues($longBytes, $entryCount, $bitsPerEntry, $valuesPerLong);
+        if ($valuesPerLong > 0 && (count($longWords) * $valuesPerLong) >= $entryCount) {
+            return $this->decodePaddedPackedValues($longWords, $entryCount, $bitsPerEntry, $valuesPerLong);
         }
 
-        return $this->decodeContiguousPackedValues($longBytes, $entryCount, $bitsPerEntry);
+        return $this->decodeContiguousPackedValues($longWords, $entryCount, $bitsPerEntry);
     }
 
     /**
-     * @param  array<int, string>  $longBytes
+     * @param  array<int, array{hi:int,lo:int}>  $longWords
      * @return array<int, int>
      */
-    private function decodePaddedPackedValues(array $longBytes, int $entryCount, int $bitsPerEntry, int $valuesPerLong): array
+    private function decodePaddedPackedValues(array $longWords, int $entryCount, int $bitsPerEntry, int $valuesPerLong): array
     {
         $values = [];
 
         for ($entryIndex = 0; $entryIndex < $entryCount; $entryIndex++) {
             $longIndex = intdiv($entryIndex, $valuesPerLong);
             $indexInLong = $entryIndex % $valuesPerLong;
-            $startBit = ($longIndex * 64) + ($indexInLong * $bitsPerEntry);
-            $values[] = $this->readPackedValue($longBytes, $startBit, $bitsPerEntry);
+            $bitOffset = $indexInLong * $bitsPerEntry;
+            $values[] = $this->readPackedBits($longWords, $longIndex, $bitOffset, $bitsPerEntry);
         }
 
         return $values;
     }
 
     /**
-     * @param  array<int, string>  $longBytes
+     * @param  array<int, array{hi:int,lo:int}>  $longWords
      * @return array<int, int>
      */
-    private function decodeContiguousPackedValues(array $longBytes, int $entryCount, int $bitsPerEntry): array
+    private function decodeContiguousPackedValues(array $longWords, int $entryCount, int $bitsPerEntry): array
     {
         $values = [];
 
         for ($entryIndex = 0; $entryIndex < $entryCount; $entryIndex++) {
-            $values[] = $this->readPackedValue($longBytes, $entryIndex * $bitsPerEntry, $bitsPerEntry);
+            $startBit = $entryIndex * $bitsPerEntry;
+            $longIndex = intdiv($startBit, 64);
+            $bitOffset = $startBit % 64;
+            $values[] = $this->readPackedBits($longWords, $longIndex, $bitOffset, $bitsPerEntry);
         }
 
         return $values;
     }
 
     /**
-     * @param  array<int, string>  $longBytes
+     * @param  array{
+     *     block_data_words: array<int, array{hi:int,lo:int}>,
+     *     bits_per_entry:?int,
+     *     values_per_long:?int,
+     *     uses_padded_layout:bool
+     * }  $section
      */
-    private function readPackedValue(array $longBytes, int $startBit, int $bitCount): int
+    private function readPackedIndexForBlock(array $section, int $blockIndex): int
     {
-        $value = 0;
+        $bitsPerEntry = (int) $section['bits_per_entry'];
+        $valuesPerLong = (int) ($section['values_per_long'] ?? 0);
 
-        for ($bitOffset = 0; $bitOffset < $bitCount; $bitOffset++) {
-            $absoluteBit = $startBit + $bitOffset;
-            $longIndex = intdiv($absoluteBit, 64);
-            $bitInLong = $absoluteBit % 64;
+        if ($section['uses_padded_layout'] && $valuesPerLong > 0) {
+            $longIndex = intdiv($blockIndex, $valuesPerLong);
+            $indexInLong = $blockIndex % $valuesPerLong;
+            $bitOffset = $indexInLong * $bitsPerEntry;
 
-            if (! isset($longBytes[$longIndex])) {
-                break;
-            }
-
-            $byteIndexFromLsb = intdiv($bitInLong, 8);
-            $bitInByte = $bitInLong % 8;
-            $bytePosition = 7 - $byteIndexFromLsb;
-            $targetByte = ord($longBytes[$longIndex][$bytePosition]);
-            $bit = ($targetByte >> $bitInByte) & 1;
-            $value |= ($bit << $bitOffset);
+            return $this->readPackedBits($section['block_data_words'], $longIndex, $bitOffset, $bitsPerEntry);
         }
 
-        return $value;
+        $startBit = $blockIndex * $bitsPerEntry;
+        $longIndex = intdiv($startBit, 64);
+        $bitOffset = $startBit % 64;
+
+        return $this->readPackedBits($section['block_data_words'], $longIndex, $bitOffset, $bitsPerEntry);
+    }
+
+    /**
+     * @param  array<int, array{hi:int,lo:int}>  $longWords
+     */
+    private function readPackedBits(array $longWords, int $longIndex, int $bitOffset, int $bitCount): int
+    {
+        if (! isset($longWords[$longIndex])) {
+            return 0;
+        }
+
+        if ($bitOffset + $bitCount <= 64) {
+            return $this->extractBitsFromWord($longWords[$longIndex], $bitOffset, $bitCount);
+        }
+
+        $firstPartBitCount = 64 - $bitOffset;
+        $firstPart = $this->extractBitsFromWord($longWords[$longIndex], $bitOffset, $firstPartBitCount);
+        $remainingBitCount = $bitCount - $firstPartBitCount;
+        $secondPart = 0;
+
+        if (isset($longWords[$longIndex + 1])) {
+            $secondPart = $this->extractBitsFromWord($longWords[$longIndex + 1], 0, $remainingBitCount);
+        }
+
+        return $firstPart | ($secondPart << $firstPartBitCount);
+    }
+
+    /**
+     * @param  array{hi:int,lo:int}  $word
+     */
+    private function extractBitsFromWord(array $word, int $bitOffset, int $bitCount): int
+    {
+        if ($bitCount <= 0) {
+            return 0;
+        }
+
+        $mask = (1 << $bitCount) - 1;
+
+        if ($bitOffset < 32) {
+            if (($bitOffset + $bitCount) <= 32) {
+                return ($word['lo'] >> $bitOffset) & $mask;
+            }
+
+            $lowBits = 32 - $bitOffset;
+            $lowMask = (1 << $lowBits) - 1;
+            $lowPart = ($word['lo'] >> $bitOffset) & $lowMask;
+            $highBits = $bitCount - $lowBits;
+            $highMask = (1 << $highBits) - 1;
+            $highPart = $word['hi'] & $highMask;
+
+            return $lowPart | ($highPart << $lowBits);
+        }
+
+        $highOffset = $bitOffset - 32;
+
+        return ($word['hi'] >> $highOffset) & $mask;
+    }
+
+    /**
+     * @param  array<int, string>  $longBytes
+     * @return array<int, array{hi:int,lo:int}>
+     */
+    private function unpackLongWords(array $longBytes): array
+    {
+        $longWords = [];
+
+        foreach ($longBytes as $bytes) {
+            $parts = unpack('Nhi/Nlo', $bytes);
+
+            $longWords[] = [
+                'hi' => (int) $parts['hi'],
+                'lo' => (int) $parts['lo'],
+            ];
+        }
+
+        return $longWords;
     }
 
     private function readSignedByte(string $binary, int &$cursor): int
