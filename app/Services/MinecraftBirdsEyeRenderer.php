@@ -7,6 +7,8 @@ use RuntimeException;
 
 class MinecraftBirdsEyeRenderer
 {
+    private const RENDER_METADATA_VERSION = 1;
+
     public function __construct(private Filesystem $files, private MinecraftRegionReader $minecraftRegionReader) {}
 
     /**
@@ -85,8 +87,49 @@ class MinecraftBirdsEyeRenderer
         }
 
         $binary = $this->files->get($regionPath);
+        $rendered = $this->renderSingleRegion($regionFile, $binary, $heightmapType);
 
-        return $this->renderSingleRegion($regionFile, $binary, $heightmapType);
+        if ($rendered === null) {
+            return null;
+        }
+
+        $metadata = [
+            'version' => self::RENDER_METADATA_VERSION,
+            'heightmap_type' => $heightmapType,
+            'source_modified_at' => $this->files->lastModified($regionPath),
+            'rendered_at' => time(),
+            'chunk_count' => $rendered['chunk_count'],
+            'min_height' => $rendered['min_height'],
+            'max_height' => $rendered['max_height'],
+        ];
+        $metadataJson = json_encode($metadata, JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR);
+        $metadataPath = $this->renderMetadataPath($regionFile);
+        $this->files->ensureDirectoryExists(dirname($metadataPath));
+        $this->files->put($metadataPath, $metadataJson);
+
+        return $rendered;
+    }
+
+    public function regionNeedsRendering(string $regionFile, string $heightmapType = 'WORLD_SURFACE'): bool
+    {
+        $regionPath = public_path('region'.DIRECTORY_SEPARATOR.$regionFile);
+        $renderPath = public_path('maps/regions'.DIRECTORY_SEPARATOR.str_replace('.mca', '.png', $regionFile));
+        $metadataPath = $this->renderMetadataPath($regionFile);
+
+        if (! $this->files->exists($regionPath) || ! $this->files->exists($renderPath) || ! $this->files->exists($metadataPath)) {
+            return true;
+        }
+
+        try {
+            /** @var array<string, mixed> $metadata */
+            $metadata = json_decode($this->files->get($metadataPath), true, flags: JSON_THROW_ON_ERROR);
+        } catch (\Throwable) {
+            return true;
+        }
+
+        return ($metadata['version'] ?? null) !== self::RENDER_METADATA_VERSION
+            || ($metadata['heightmap_type'] ?? null) !== $heightmapType
+            || ($metadata['source_modified_at'] ?? null) !== $this->files->lastModified($regionPath);
     }
 
     /**
@@ -1232,5 +1275,10 @@ class MinecraftBirdsEyeRenderer
         $cursor += $length;
 
         return $chunk;
+    }
+
+    private function renderMetadataPath(string $regionFile): string
+    {
+        return public_path('maps/regions'.DIRECTORY_SEPARATOR.'.meta'.DIRECTORY_SEPARATOR.str_replace('.mca', '.json', $regionFile));
     }
 }

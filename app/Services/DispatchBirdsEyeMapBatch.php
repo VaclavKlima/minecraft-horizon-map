@@ -9,7 +9,10 @@ use RuntimeException;
 
 class DispatchBirdsEyeMapBatch
 {
-    public function __construct(private MinecraftRegionReader $minecraftRegionReader) {}
+    public function __construct(
+        private MinecraftRegionReader $minecraftRegionReader,
+        private MinecraftBirdsEyeRenderer $minecraftBirdsEyeRenderer
+    ) {}
 
     /**
      * @return array{batch_id:string,region_count:int,message:string}
@@ -26,10 +29,23 @@ class DispatchBirdsEyeMapBatch
             throw new RuntimeException('No region files found in public/region.');
         }
 
+        $regionsToQueue = array_values(array_filter(
+            $regionFiles,
+            fn (string $regionFile): bool => $this->minecraftBirdsEyeRenderer->regionNeedsRendering($regionFile, $heightmapType)
+        ));
+
+        if ($regionsToQueue === []) {
+            return [
+                'batch_id' => '',
+                'region_count' => 0,
+                'message' => 'No changed regions detected.',
+            ];
+        }
+
         $jobs = array_map(fn (string $regionFile): array => [
             new RenderRegionMapImageJob($regionFile, $heightmapType),
             new GenerateRegionTilesJob($regionFile),
-        ], $regionFiles);
+        ], $regionsToQueue);
 
         $batch = Bus::batch($jobs)
             ->name('Render Minecraft birds-eye map')
@@ -38,7 +54,7 @@ class DispatchBirdsEyeMapBatch
 
         return [
             'batch_id' => $batch->id,
-            'region_count' => count($regionFiles),
+            'region_count' => count($regionsToQueue),
             'message' => 'Queued map generation jobs.',
         ];
     }

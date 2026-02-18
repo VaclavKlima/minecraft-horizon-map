@@ -102,9 +102,7 @@ class MinecraftMapTileService
             return;
         }
 
-        $sourceModifiedAt = $this->files->lastModified($sourcePath);
-        $this->files->deleteDirectory($this->tilesRootPath($regionFile));
-        $this->rebuildManifest($regionFile, $sourceModifiedAt);
+        $this->ensureManifestIsFresh($regionFile);
         $this->generateAllTilesFromManifest($regionFile, true);
     }
 
@@ -120,9 +118,7 @@ class MinecraftMapTileService
             return;
         }
 
-        $sourceSignature = $this->combinedSourceSignature($regions);
-        $this->files->deleteDirectory($this->tilesRootPath(self::ALL_REGIONS));
-        $this->rebuildCombinedManifest($regions, $sourceSignature);
+        $this->ensureCombinedManifestIsFresh($regions);
         $this->generateAllTilesFromManifest(self::ALL_REGIONS, true);
     }
 
