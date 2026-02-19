@@ -2,7 +2,6 @@
 
 namespace App\Jobs;
 
-use App\Services\MinecraftBirdsEyeRenderer;
 use App\Services\MinecraftIsometricRenderer;
 use Illuminate\Bus\Batchable;
 use Illuminate\Contracts\Queue\ShouldQueue;
@@ -12,26 +11,16 @@ class RenderRegionIsometricImageJob implements ShouldQueue
 {
     use Batchable, Queueable;
 
-    public int $timeout = 1200;
-
     public int $tries = 1;
 
     public function __construct(public string $regionFile, public string $heightmapType = 'WORLD_SURFACE') {}
 
-    public function handle(MinecraftBirdsEyeRenderer $minecraftBirdsEyeRenderer, MinecraftIsometricRenderer $minecraftIsometricRenderer): void
+    public function handle(MinecraftIsometricRenderer $minecraftIsometricRenderer): void
     {
         if ($this->batch()?->cancelled()) {
             return;
         }
 
-        if ($minecraftBirdsEyeRenderer->regionNeedsRendering($this->regionFile, $this->heightmapType)) {
-            $region = $minecraftBirdsEyeRenderer->renderRegion($this->regionFile, $this->heightmapType);
-
-            if ($region === null) {
-                return;
-            }
-        }
-
-        $minecraftIsometricRenderer->renderRegion($this->regionFile);
+        $minecraftIsometricRenderer->renderRegion($this->regionFile, $this->heightmapType);
     }
 }

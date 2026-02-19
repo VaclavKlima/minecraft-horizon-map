@@ -94,6 +94,8 @@
             let requestedViewState = null;
             let urlSyncTimeout = null;
             let tileRetryTimer = null;
+            let activeBatchId = null;
+            let batchPollTimer = null;
 
             const tileSize = 256;
             const urlParams = new URLSearchParams(window.location.search);
@@ -193,6 +195,20 @@
                 }
 
                 return `/api/maps/tiles/${level}/${x}/${y}.png?${params.toString()}`;
+            }
+
+            function resetActiveTiles() {
+                activeTiles.forEach(tile => tile.remove());
+                activeTiles.clear();
+            }
+
+            function stopBatchPolling() {
+                activeBatchId = null;
+
+                if (batchPollTimer !== null) {
+                    window.clearTimeout(batchPollTimer);
+                    batchPollTimer = null;
+                }
             }
 
             function renderTiles() {
@@ -315,14 +331,14 @@
                 zoom = nextZoom;
                 offsetX = Math.floor(worldX / targetDivisor - pointerX);
                 offsetY = Math.floor(worldY / targetDivisor - pointerY);
-                activeTiles.forEach(tile => tile.remove());
-                activeTiles.clear();
+                resetActiveTiles();
                 renderTiles();
             }
 
-            async function loadManifest(region = selectedRegion) {
+            async function loadManifest(region = selectedRegion, preserveView = false) {
                 setStatus('Loading map manifest...');
                 selectedRegion = region || null;
+                const hadManifest = manifest !== null;
                 const query = buildQueryString(true);
                 const response = await fetch(`/api/maps/manifest?${query}`);
                 const payload = await response.json();
@@ -332,8 +348,7 @@
                     selectedRegion = null;
                     regionSelect.innerHTML = '<option value="">No regions</option>';
                     regionSelect.disabled = true;
-                    activeTiles.forEach(tile => tile.remove());
-                    activeTiles.clear();
+                    resetActiveTiles();
                     setStatus(payload.message ?? 'Map not available.');
                     scheduleUrlStateSync();
                     return;
@@ -342,10 +357,56 @@
                 manifest = payload.manifest;
                 selectedRegion = manifest.selected_region;
                 renderRegionOptions();
-                fitInitialPosition();
+                if (preserveView && hadManifest) {
+                    zoom = Math.min(zoom, manifest.max_zoom);
+                    clampOffsets();
+                } else {
+                    fitInitialPosition();
+                }
+
+                resetActiveTiles();
                 renderTiles();
                 setStatus(`Map loaded (${selectedProjection}, ${selectedRegion}): ${manifest.source_width} x ${manifest.source_height} blocks`);
                 scheduleUrlStateSync();
+            }
+
+            async function pollBatchUntilFinished(batchId) {
+                stopBatchPolling();
+                activeBatchId = batchId;
+
+                const poll = async () => {
+                    if (activeBatchId !== batchId) {
+                        return;
+                    }
+
+                    try {
+                        const response = await fetch(`/api/maps/batches/${batchId}`);
+
+                        if (!response.ok) {
+                            throw new Error('Unable to read queue batch progress.');
+                        }
+
+                        const payload = await response.json();
+                        await loadManifest(selectedRegion, true);
+                        const processedJobs = payload.processed_jobs ?? 0;
+                        const totalJobs = payload.total_jobs ?? 0;
+                        const failedJobs = payload.failed_jobs ?? 0;
+
+                        if (payload.finished === true) {
+                            setStatus(`Batch ${batchId} complete (${processedJobs}/${totalJobs}, failed: ${failedJobs}).`);
+                            stopBatchPolling();
+                            return;
+                        }
+
+                        setStatus(`Batch ${batchId}: ${processedJobs}/${totalJobs} jobs finished, failed: ${failedJobs}.`);
+                        batchPollTimer = window.setTimeout(poll, 1200);
+                    } catch (error) {
+                        setStatus(error.message);
+                        batchPollTimer = window.setTimeout(poll, 2000);
+                    }
+                };
+
+                await poll();
             }
 
             async function renderWorldMap() {
@@ -374,12 +435,17 @@
 
                     const payload = await response.json();
                     const queuedRegions = payload.region_count ?? 0;
-                    const batchId = payload.batch_id ?? 'unknown';
+                    const batchId = payload.batch_id ?? '';
 
-                    setStatus(`Queued ${queuedRegions} ${selectedProjection} region jobs (batch ${batchId}). Tiles will appear as jobs finish.`);
-                    window.setTimeout(() => {
-                        loadManifest(selectedRegion).catch(error => setStatus(error.message));
-                    }, 1500);
+                    if (queuedRegions === 0 || batchId === '') {
+                        setStatus(payload.message ?? 'No changed regions detected.');
+                        await loadManifest(selectedRegion, true);
+
+                        return;
+                    }
+
+                    setStatus(`Queued ${queuedRegions} ${selectedProjection} region jobs (batch ${batchId}).`);
+                    await pollBatchUntilFinished(batchId);
                 } catch (error) {
                     setStatus(error.message);
                 } finally {
@@ -438,17 +504,16 @@
             renderButton.addEventListener('click', renderWorldMap);
             regionSelect.addEventListener('change', () => {
                 selectedRegion = regionSelect.value || null;
-                activeTiles.forEach(tile => tile.remove());
-                activeTiles.clear();
+                resetActiveTiles();
                 scheduleUrlStateSync();
                 loadManifest(selectedRegion).catch(error => setStatus(error.message));
             });
 
             projectionSelect.addEventListener('change', () => {
+                stopBatchPolling();
                 selectedProjection = projectionSelect.value || 'birds-eye';
                 selectedRegion = null;
-                activeTiles.forEach(tile => tile.remove());
-                activeTiles.clear();
+                resetActiveTiles();
                 scheduleUrlStateSync();
                 loadManifest(null).catch(error => setStatus(error.message));
             });

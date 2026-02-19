@@ -7,7 +7,7 @@ use RuntimeException;
 
 class MinecraftIsometricRenderer
 {
-    private const RENDER_METADATA_VERSION = 9;
+    private const RENDER_METADATA_VERSION = 14;
 
     private const DEPTH_SCALE = 0.6;
 
@@ -15,11 +15,10 @@ class MinecraftIsometricRenderer
 
     private const HEIGHT_CEILING = 384;
 
-    private const VOXEL_LAYERS = 24;
-
-    private const VOXEL_BYTES_PER_LAYER = 3;
-
-    public function __construct(private Filesystem $files) {}
+    public function __construct(
+        private Filesystem $files,
+        private MinecraftBirdsEyeRenderer $minecraftBirdsEyeRenderer
+    ) {}
 
     /**
      * @return array{
@@ -30,37 +29,48 @@ class MinecraftIsometricRenderer
      *     height_blocks:int
      * }|null
      */
-    public function renderRegion(string $regionFile): ?array
+    public function renderRegion(string $regionFile, string $heightmapType = 'WORLD_SURFACE'): ?array
     {
-        $sourcePath = $this->sourceMapPath($regionFile);
+        $snapshot = $this->minecraftBirdsEyeRenderer->buildRegionSectionSnapshot($regionFile);
 
-        if (! $this->files->exists($sourcePath)) {
+        if ($snapshot === null) {
             return null;
         }
 
-        $sourceImage = imagecreatefrompng($sourcePath);
+        $sourceWidth = (int) $snapshot['width_blocks'];
+        $sourceHeight = (int) $snapshot['height_blocks'];
+        $sectionsByChunk = [];
+        $minSectionY = null;
+        $maxSectionY = null;
 
-        if ($sourceImage === false) {
-            throw new RuntimeException('Unable to open source birds-eye map image for isometric rendering.');
+        foreach ($snapshot['chunks'] as $chunk) {
+            $chunkKey = $this->chunkKey((int) $chunk['chunk_x'], (int) $chunk['chunk_z']);
+            $sectionsByChunk[$chunkKey] = $chunk['sections'];
+            $sectionYs = array_keys($chunk['sections']);
+
+            if ($sectionYs === []) {
+                continue;
+            }
+
+            $chunkMinSectionY = (int) min($sectionYs);
+            $chunkMaxSectionY = (int) max($sectionYs);
+            $minSectionY = $minSectionY === null ? $chunkMinSectionY : min($minSectionY, $chunkMinSectionY);
+            $maxSectionY = $maxSectionY === null ? $chunkMaxSectionY : max($maxSectionY, $chunkMaxSectionY);
         }
 
-        $heightMapPath = $this->heightMapPath($regionFile);
-        $heightImage = $this->files->exists($heightMapPath) ? imagecreatefrompng($heightMapPath) : false;
-        $surfaceMapPath = $this->surfaceMapPath($regionFile);
-        $surfaceImage = $this->files->exists($surfaceMapPath) ? imagecreatefrompng($surfaceMapPath) : false;
-        $voxelMapPath = $this->voxelMapPath($regionFile);
-        $voxelData = $this->files->exists($voxelMapPath) ? $this->files->get($voxelMapPath) : null;
+        if ($sectionsByChunk === [] || $minSectionY === null || $maxSectionY === null) {
+            return null;
+        }
 
-        $sourceWidth = imagesx($sourceImage);
-        $sourceHeight = imagesy($sourceImage);
-        $heightSpan = self::HEIGHT_CEILING - self::HEIGHT_BASELINE;
+        $minY = $minSectionY * 16;
+        $maxY = ($maxSectionY * 16) + 15;
+        $heightSpan = max(1, $maxY - $minY + 1);
         $verticalDepthPadding = (int) ceil($heightSpan * self::DEPTH_SCALE);
         $isoWidth = $sourceWidth + $sourceHeight;
-        $isoHeight = (int) ceil(($sourceWidth + $sourceHeight) / 2) + $verticalDepthPadding + 2;
+        $isoHeight = (int) ceil(($sourceWidth + $sourceHeight) / 2) + $verticalDepthPadding + 8;
         $isometricImage = imagecreatetruecolor($isoWidth, $isoHeight);
 
         if ($isometricImage === false) {
-            imagedestroy($sourceImage);
             throw new RuntimeException('Unable to allocate isometric output image.');
         }
 
@@ -70,148 +80,114 @@ class MinecraftIsometricRenderer
         imagefill($isometricImage, 0, 0, $transparent);
 
         $colorCache = [];
-        $wallColorCache = [];
-        $depthOffsets = $this->buildDepthOffsetMap($heightImage, $sourceWidth, $sourceHeight);
-        $surfaceMasks = $this->buildSurfaceMasks($surfaceImage, $sourceWidth, $sourceHeight);
-        $hasVoxelData = $this->hasUsableVoxelData($voxelData, $sourceWidth, $sourceHeight);
-        $columnBytes = self::VOXEL_LAYERS * self::VOXEL_BYTES_PER_LAYER;
+        $depthBuffer = array_fill(0, $isoWidth * $isoHeight, PHP_INT_MIN);
 
-        for ($sourceY = 0; $sourceY < $sourceHeight; $sourceY++) {
-            for ($sourceX = 0; $sourceX < $sourceWidth; $sourceX++) {
-                $sourceColor = imagecolorat($sourceImage, $sourceX, $sourceY);
-                $r = ($sourceColor >> 16) & 0xFF;
-                $g = ($sourceColor >> 8) & 0xFF;
-                $b = $sourceColor & 0xFF;
-                $a = ($sourceColor & 0x7F000000) >> 24;
-                $cacheKey = ($a << 24) | ($r << 16) | ($g << 8) | $b;
+        foreach ($snapshot['chunks'] as $chunk) {
+            $chunkX = (int) $chunk['chunk_x'];
+            $chunkZ = (int) $chunk['chunk_z'];
+            /** @var array<int, array<string, mixed>> $chunkSections */
+            $chunkSections = $chunk['sections'];
 
-                if (! array_key_exists($cacheKey, $colorCache)) {
-                    $colorCache[$cacheKey] = imagecolorallocatealpha($isometricImage, $r, $g, $b, $a);
-                }
+            foreach ($chunkSections as $sectionY => $section) {
+                for ($localY = 0; $localY < 16; $localY++) {
+                    for ($localZ = 0; $localZ < 16; $localZ++) {
+                        for ($localX = 0; $localX < 16; $localX++) {
+                            $paletteIndex = $this->paletteIndexAt($section, $localX, $localZ, $localY);
 
-                $depthOffset = $this->depthOffsetAt($depthOffsets, $sourceWidth, $sourceX, $sourceY);
-                $isoX = ($sourceX - $sourceY) + ($sourceHeight - 1);
-                $isoY = (int) floor(($sourceX + $sourceY) / 2) + $verticalDepthPadding - $depthOffset;
-                imagesetpixel($isometricImage, $isoX, $isoY, $colorCache[$cacheKey]);
-
-                $currentMask = $this->surfaceMaskAt($surfaceMasks, $sourceWidth, $sourceX, $sourceY);
-
-                if ($currentMask === 0) {
-                    continue;
-                }
-
-                $eastMask = 0;
-
-                if ($sourceX < ($sourceWidth - 1)) {
-                    $eastMask = $this->surfaceMaskAt($surfaceMasks, $sourceWidth, $sourceX + 1, $sourceY);
-                }
-
-                $southMask = 0;
-
-                if ($sourceY < ($sourceHeight - 1)) {
-                    $southMask = $this->surfaceMaskAt($surfaceMasks, $sourceWidth, $sourceX, $sourceY + 1);
-                }
-
-                $eastVisibleMask = $currentMask & (~$eastMask & 0xFFFFFF);
-                $southVisibleMask = $currentMask & (~$southMask & 0xFFFFFF);
-                $visibleMask = $eastVisibleMask | $southVisibleMask;
-
-                if ($visibleMask === 0) {
-                    continue;
-                }
-
-                if ($hasVoxelData && $voxelData !== null) {
-                    $pixelIndex = ($sourceY * $sourceWidth) + $sourceX;
-                    $baseOffset = $pixelIndex * $columnBytes;
-
-                    for ($depthLayer = 0; $depthLayer < self::VOXEL_LAYERS; $depthLayer++) {
-                        $layerBit = 1 << $depthLayer;
-
-                        if (($visibleMask & $layerBit) === 0) {
-                            continue;
-                        }
-
-                        $layerOffset = $baseOffset + ($depthLayer * self::VOXEL_BYTES_PER_LAYER);
-                        $cr = ord($voxelData[$layerOffset]);
-                        $cg = ord($voxelData[$layerOffset + 1]);
-                        $cb = ord($voxelData[$layerOffset + 2]);
-
-                        if ($cr === 0 && $cg === 0 && $cb === 0) {
-                            continue;
-                        }
-
-                        $wallY = $isoY + max(1, (int) round(($depthLayer + 1) * self::DEPTH_SCALE));
-
-                        if ($wallY >= $isoHeight) {
-                            continue;
-                        }
-
-                        if (($eastVisibleMask & $layerBit) !== 0) {
-                            $wr = (int) round($cr * 0.8);
-                            $wg = (int) round($cg * 0.8);
-                            $wb = (int) round($cb * 0.8);
-                            $wallCacheKey = ($a << 24) | ($wr << 16) | ($wg << 8) | $wb;
-
-                            if (! array_key_exists($wallCacheKey, $wallColorCache)) {
-                                $wallColorCache[$wallCacheKey] = imagecolorallocatealpha($isometricImage, $wr, $wg, $wb, $a);
+                            if (($section['palette_is_air'][$paletteIndex] ?? true) === true) {
+                                continue;
                             }
 
-                            $eastFaceX = $isoX + 1;
+                            $worldX = ($chunkX * 16) + $localX;
+                            $worldY = ((int) $sectionY * 16) + $localY;
+                            $worldZ = ($chunkZ * 16) + $localZ;
 
-                            if ($eastFaceX >= 0 && $eastFaceX < $isoWidth) {
-                                imagesetpixel($isometricImage, $eastFaceX, $wallY, $wallColorCache[$wallCacheKey]);
-                            }
-                        }
-
-                        if (($southVisibleMask & $layerBit) !== 0) {
-                            $wr = (int) round($cr * 0.72);
-                            $wg = (int) round($cg * 0.72);
-                            $wb = (int) round($cb * 0.72);
-                            $wallCacheKey = ($a << 24) | ($wr << 16) | ($wg << 8) | $wb;
-
-                            if (! array_key_exists($wallCacheKey, $wallColorCache)) {
-                                $wallColorCache[$wallCacheKey] = imagecolorallocatealpha($isometricImage, $wr, $wg, $wb, $a);
+                            if ($worldX < 0 || $worldX >= $sourceWidth || $worldZ < 0 || $worldZ >= $sourceHeight) {
+                                continue;
                             }
 
-                            $southFaceX = $isoX - 1;
+                            $topExposed = ! $this->isSolidAt($sectionsByChunk, $worldX, $worldY + 1, $worldZ, $minY, $maxY);
+                            $eastExposed = ! $this->isSolidAt($sectionsByChunk, $worldX + 1, $worldY, $worldZ, $minY, $maxY);
+                            $southExposed = ! $this->isSolidAt($sectionsByChunk, $worldX, $worldY, $worldZ + 1, $minY, $maxY);
 
-                            if ($southFaceX >= 0 && $southFaceX < $isoWidth) {
-                                imagesetpixel($isometricImage, $southFaceX, $wallY, $wallColorCache[$wallCacheKey]);
+                            if (! $topExposed && ! $eastExposed && ! $southExposed) {
+                                continue;
                             }
+
+                            [$red, $green, $blue] = $section['palette_colors'][$paletteIndex] ?? [90, 90, 92];
+                            $topColor = $this->colorHandle($isometricImage, $colorCache, $red, $green, $blue, 0);
+                            $isoX = ($worldX - $worldZ) + ($sourceHeight - 1);
+                            $depthOffset = $this->depthOffsetForHeight($worldY + 1);
+                            $isoY = (int) floor(($worldX + $worldZ) / 2) + $verticalDepthPadding - $depthOffset;
+                            $baseDepth = (($worldX + $worldZ) * 8192) + ($worldY * 4);
+
+                            if ($topExposed) {
+                                $this->plotPixelIfCloser($isometricImage, $depthBuffer, $isoWidth, $isoX, $isoY, $topColor, $baseDepth + 3);
+                            }
+
+                            $sideStep = max(1, (int) round(self::DEPTH_SCALE));
+
+                            if ($eastExposed) {
+                                $eastColor = $this->colorHandle(
+                                    $isometricImage,
+                                    $colorCache,
+                                    (int) round($red * 0.80),
+                                    (int) round($green * 0.80),
+                                    (int) round($blue * 0.80),
+                                    0
+                                );
+
+                                for ($step = 1; $step <= $sideStep; $step++) {
+                                    $this->plotPixelIfCloser(
+                                        $isometricImage,
+                                        $depthBuffer,
+                                        $isoWidth,
+                                        $isoX + 1,
+                                        $isoY + $step,
+                                        $eastColor,
+                                        $baseDepth + 2
+                                    );
+                                }
+                            }
+
+                            if ($southExposed) {
+                                $southColor = $this->colorHandle(
+                                    $isometricImage,
+                                    $colorCache,
+                                    (int) round($red * 0.72),
+                                    (int) round($green * 0.72),
+                                    (int) round($blue * 0.72),
+                                    0
+                                );
+
+                                for ($step = 1; $step <= $sideStep; $step++) {
+                                    $this->plotPixelIfCloser(
+                                        $isometricImage,
+                                        $depthBuffer,
+                                        $isoWidth,
+                                        $isoX - 1,
+                                        $isoY + $step,
+                                        $southColor,
+                                        $baseDepth + 1
+                                    );
+                                }
+                            }
+
+                            $this->renderPhysicalShadow(
+                                $isometricImage,
+                                $depthBuffer,
+                                $colorCache,
+                                $sectionsByChunk,
+                                $isoWidth,
+                                $sourceHeight,
+                                $verticalDepthPadding,
+                                $worldX,
+                                $worldY,
+                                $worldZ,
+                                $minY,
+                                $maxY
+                            );
                         }
-                    }
-                } else {
-                    for ($depthLayer = 0; $depthLayer < self::VOXEL_LAYERS; $depthLayer++) {
-                        $layerBit = 1 << $depthLayer;
-
-                        if (($visibleMask & $layerBit) === 0) {
-                            continue;
-                        }
-
-                        $eastOpen = ($eastVisibleMask & $layerBit) !== 0;
-                        $southOpen = ($southVisibleMask & $layerBit) !== 0;
-
-                        if (! $eastOpen && ! $southOpen) {
-                            continue;
-                        }
-
-                        $wallY = $isoY + max(1, (int) round(($depthLayer + 1) * self::DEPTH_SCALE));
-
-                        if ($wallY >= $isoHeight) {
-                            continue;
-                        }
-
-                        $shadeFactor = $eastOpen && $southOpen ? 0.72 : 0.78;
-                        $wr = (int) round($r * $shadeFactor);
-                        $wg = (int) round($g * $shadeFactor);
-                        $wb = (int) round($b * $shadeFactor);
-                        $wallCacheKey = ($a << 24) | ($wr << 16) | ($wg << 8) | $wb;
-
-                        if (! array_key_exists($wallCacheKey, $wallColorCache)) {
-                            $wallColorCache[$wallCacheKey] = imagecolorallocatealpha($isometricImage, $wr, $wg, $wb, $a);
-                        }
-
-                        imagesetpixel($isometricImage, $isoX, $wallY, $wallColorCache[$wallCacheKey]);
                     }
                 }
             }
@@ -222,19 +198,11 @@ class MinecraftIsometricRenderer
         $this->files->ensureDirectoryExists(dirname($outputPath));
         imagepng($isometricImage, $outputPath);
         imagedestroy($isometricImage);
-        imagedestroy($sourceImage);
-
-        if ($heightImage !== false) {
-            imagedestroy($heightImage);
-        }
-
-        if ($surfaceImage !== false) {
-            imagedestroy($surfaceImage);
-        }
 
         $metadata = [
             'version' => self::RENDER_METADATA_VERSION,
-            'source_modified_at' => $this->files->lastModified($sourcePath),
+            'heightmap_type' => $heightmapType,
+            'source_modified_at' => $this->files->lastModified($this->regionPath($regionFile)),
             'rendered_at' => time(),
         ];
         $metadataPath = $this->renderMetadataPath($regionFile);
@@ -250,23 +218,13 @@ class MinecraftIsometricRenderer
         ];
     }
 
-    public function regionNeedsRendering(string $regionFile): bool
+    public function regionNeedsRendering(string $regionFile, string $heightmapType = 'WORLD_SURFACE'): bool
     {
-        $sourcePath = $this->sourceMapPath($regionFile);
+        $sourcePath = $this->regionPath($regionFile);
         $renderPath = $this->isometricRegionPath($regionFile);
         $metadataPath = $this->renderMetadataPath($regionFile);
-        $heightMapPath = $this->heightMapPath($regionFile);
-        $surfaceMapPath = $this->surfaceMapPath($regionFile);
-        $voxelMapPath = $this->voxelMapPath($regionFile);
 
-        if (
-            ! $this->files->exists($sourcePath)
-            || ! $this->files->exists($renderPath)
-            || ! $this->files->exists($metadataPath)
-            || ! $this->files->exists($heightMapPath)
-            || ! $this->files->exists($surfaceMapPath)
-            || ! $this->files->exists($voxelMapPath)
-        ) {
+        if (! $this->files->exists($sourcePath) || ! $this->files->exists($renderPath) || ! $this->files->exists($metadataPath)) {
             return true;
         }
 
@@ -278,12 +236,13 @@ class MinecraftIsometricRenderer
         }
 
         return ($metadata['version'] ?? null) !== self::RENDER_METADATA_VERSION
+            || ($metadata['heightmap_type'] ?? null) !== $heightmapType
             || ($metadata['source_modified_at'] ?? null) !== $this->files->lastModified($sourcePath);
     }
 
-    private function sourceMapPath(string $regionFile): string
+    private function regionPath(string $regionFile): string
     {
-        return public_path('maps/regions'.DIRECTORY_SEPARATOR.str_replace('.mca', '.png', $regionFile));
+        return public_path('region'.DIRECTORY_SEPARATOR.$regionFile);
     }
 
     private function isometricRegionPath(string $regionFile): string
@@ -296,101 +255,303 @@ class MinecraftIsometricRenderer
         return public_path('maps/isometric/regions'.DIRECTORY_SEPARATOR.'.meta'.DIRECTORY_SEPARATOR.str_replace('.mca', '.json', $regionFile));
     }
 
-    private function heightMapPath(string $regionFile): string
+    private function chunkKey(int $chunkX, int $chunkZ): string
     {
-        return public_path('maps/regions'.DIRECTORY_SEPARATOR.'.heights'.DIRECTORY_SEPARATOR.str_replace('.mca', '.png', $regionFile));
+        return $chunkX.':'.$chunkZ;
     }
 
-    private function surfaceMapPath(string $regionFile): string
+    private function depthOffsetForHeight(int $height): int
     {
-        return public_path('maps/regions'.DIRECTORY_SEPARATOR.'.surface'.DIRECTORY_SEPARATOR.str_replace('.mca', '.png', $regionFile));
-    }
+        $clampedHeight = max(self::HEIGHT_BASELINE, min(self::HEIGHT_CEILING, $height));
 
-    private function voxelMapPath(string $regionFile): string
-    {
-        return public_path('maps/regions'.DIRECTORY_SEPARATOR.'.voxels'.DIRECTORY_SEPARATOR.str_replace('.mca', '.bin', $regionFile));
-    }
-
-    private function decodeHeightAt(\GdImage $heightImage, int $x, int $y): int
-    {
-        $encodedColor = imagecolorat($heightImage, $x, $y);
-        $red = ($encodedColor >> 16) & 0xFF;
-        $green = ($encodedColor >> 8) & 0xFF;
-        $encodedHeight = ($red << 8) | $green;
-
-        return $encodedHeight - 32768;
+        return (int) round(($clampedHeight - self::HEIGHT_BASELINE) * self::DEPTH_SCALE);
     }
 
     /**
-     * @return array<int, int>
+     * @param  array<string, array<int, array<string, mixed>>>  $sectionsByChunk
      */
-    private function buildDepthOffsetMap(\GdImage|false $heightImage, int $width, int $height): array
+    private function isSolidAt(array $sectionsByChunk, int $worldX, int $worldY, int $worldZ, int $minY, int $maxY): bool
     {
-        $depthOffsets = array_fill(0, $width * $height, 0);
-
-        if ($heightImage === false) {
-            return $depthOffsets;
-        }
-
-        for ($y = 0; $y < $height; $y++) {
-            for ($x = 0; $x < $width; $x++) {
-                $surfaceHeight = $this->decodeHeightAt($heightImage, $x, $y);
-                $clampedHeight = max(self::HEIGHT_BASELINE, min(self::HEIGHT_CEILING, $surfaceHeight));
-                $depthOffsets[($y * $width) + $x] = (int) round(($clampedHeight - self::HEIGHT_BASELINE) * self::DEPTH_SCALE);
-            }
-        }
-
-        return $depthOffsets;
-    }
-
-    /**
-     * @return array<int, int>
-     */
-    private function buildSurfaceMasks(\GdImage|false $surfaceImage, int $width, int $height): array
-    {
-        $masks = array_fill(0, $width * $height, 0);
-
-        if ($surfaceImage === false) {
-            return $masks;
-        }
-
-        for ($y = 0; $y < $height; $y++) {
-            for ($x = 0; $x < $width; $x++) {
-                $color = imagecolorat($surfaceImage, $x, $y);
-                $red = ($color >> 16) & 0xFF;
-                $green = ($color >> 8) & 0xFF;
-                $blue = $color & 0xFF;
-                $masks[($y * $width) + $x] = ($red << 16) | ($green << 8) | $blue;
-            }
-        }
-
-        return $masks;
-    }
-
-    /**
-     * @param  array<int, int>  $depthOffsets
-     */
-    private function depthOffsetAt(array $depthOffsets, int $width, int $x, int $y): int
-    {
-        return $depthOffsets[($y * $width) + $x] ?? 0;
-    }
-
-    /**
-     * @param  array<int, int>  $surfaceMasks
-     */
-    private function surfaceMaskAt(array $surfaceMasks, int $width, int $x, int $y): int
-    {
-        return $surfaceMasks[($y * $width) + $x] ?? 0;
-    }
-
-    private function hasUsableVoxelData(?string $voxelData, int $width, int $height): bool
-    {
-        if ($voxelData === null) {
+        if ($worldY < $minY || $worldY > $maxY || $worldX < 0 || $worldX >= 512 || $worldZ < 0 || $worldZ >= 512) {
             return false;
         }
 
-        $expectedBytes = $width * $height * self::VOXEL_LAYERS * self::VOXEL_BYTES_PER_LAYER;
+        $section = $this->sectionAt($sectionsByChunk, $worldX, $worldY, $worldZ);
 
-        return strlen($voxelData) === $expectedBytes;
+        if ($section === null) {
+            return false;
+        }
+
+        $localX = $worldX % 16;
+        $localZ = $worldZ % 16;
+        $sectionY = $this->floorDivide($worldY, 16);
+        $localY = $worldY - ($sectionY * 16);
+        $paletteIndex = $this->paletteIndexAt($section, $localX, $localZ, $localY);
+
+        return ($section['palette_is_air'][$paletteIndex] ?? true) === false;
+    }
+
+    /**
+     * @param  array<string, array<int, array<string, mixed>>>  $sectionsByChunk
+     * @return array{0:int,1:int,2:int}|null
+     */
+    private function colorAt(array $sectionsByChunk, int $worldX, int $worldY, int $worldZ): ?array
+    {
+        $section = $this->sectionAt($sectionsByChunk, $worldX, $worldY, $worldZ);
+
+        if ($section === null) {
+            return null;
+        }
+
+        $localX = $worldX % 16;
+        $localZ = $worldZ % 16;
+        $sectionY = $this->floorDivide($worldY, 16);
+        $localY = $worldY - ($sectionY * 16);
+        $paletteIndex = $this->paletteIndexAt($section, $localX, $localZ, $localY);
+
+        if (($section['palette_is_air'][$paletteIndex] ?? true) === true) {
+            return null;
+        }
+
+        return $section['palette_colors'][$paletteIndex] ?? [90, 90, 92];
+    }
+
+    /**
+     * @param  array<string, array<int, array<string, mixed>>>  $sectionsByChunk
+     * @return array<string, mixed>|null
+     */
+    private function sectionAt(array $sectionsByChunk, int $worldX, int $worldY, int $worldZ): ?array
+    {
+        $chunkX = intdiv($worldX, 16);
+        $chunkZ = intdiv($worldZ, 16);
+        $sectionY = $this->floorDivide($worldY, 16);
+        $chunkKey = $this->chunkKey($chunkX, $chunkZ);
+
+        return $sectionsByChunk[$chunkKey][$sectionY] ?? null;
+    }
+
+    private function floorDivide(int $value, int $divisor): int
+    {
+        $quotient = intdiv($value, $divisor);
+
+        if (($value % $divisor) !== 0 && $value < 0) {
+            return $quotient - 1;
+        }
+
+        return $quotient;
+    }
+
+    /**
+     * @param  array{
+     *     block_data_words: array<int, array{hi:int,lo:int}>,
+     *     bits_per_entry:?int,
+     *     values_per_long:?int,
+     *     uses_padded_layout:bool
+     * }  $section
+     */
+    private function paletteIndexAt(array $section, int $localX, int $localZ, int $yInSection): int
+    {
+        $blockIndex = ($yInSection * 256) + ($localZ * 16) + $localX;
+
+        if ($section['bits_per_entry'] === null || $section['block_data_words'] === []) {
+            return 0;
+        }
+
+        return $this->readPackedIndexForBlock($section, $blockIndex);
+    }
+
+    /**
+     * @param  array{
+     *     block_data_words: array<int, array{hi:int,lo:int}>,
+     *     bits_per_entry:?int,
+     *     values_per_long:?int,
+     *     uses_padded_layout:bool
+     * }  $section
+     */
+    private function readPackedIndexForBlock(array $section, int $blockIndex): int
+    {
+        $bitsPerEntry = (int) $section['bits_per_entry'];
+        $valuesPerLong = (int) ($section['values_per_long'] ?? 0);
+
+        if ($section['uses_padded_layout'] && $valuesPerLong > 0) {
+            $longIndex = intdiv($blockIndex, $valuesPerLong);
+            $indexInLong = $blockIndex % $valuesPerLong;
+            $bitOffset = $indexInLong * $bitsPerEntry;
+
+            return $this->readPackedBits($section['block_data_words'], $longIndex, $bitOffset, $bitsPerEntry);
+        }
+
+        $startBit = $blockIndex * $bitsPerEntry;
+        $longIndex = intdiv($startBit, 64);
+        $bitOffset = $startBit % 64;
+
+        return $this->readPackedBits($section['block_data_words'], $longIndex, $bitOffset, $bitsPerEntry);
+    }
+
+    /**
+     * @param  array<int, array{hi:int,lo:int}>  $longWords
+     */
+    private function readPackedBits(array $longWords, int $longIndex, int $bitOffset, int $bitCount): int
+    {
+        if (! isset($longWords[$longIndex])) {
+            return 0;
+        }
+
+        if ($bitOffset + $bitCount <= 64) {
+            return $this->extractBitsFromWord($longWords[$longIndex], $bitOffset, $bitCount);
+        }
+
+        $firstPartBitCount = 64 - $bitOffset;
+        $firstPart = $this->extractBitsFromWord($longWords[$longIndex], $bitOffset, $firstPartBitCount);
+        $remainingBitCount = $bitCount - $firstPartBitCount;
+        $secondPart = 0;
+
+        if (isset($longWords[$longIndex + 1])) {
+            $secondPart = $this->extractBitsFromWord($longWords[$longIndex + 1], 0, $remainingBitCount);
+        }
+
+        return $firstPart | ($secondPart << $firstPartBitCount);
+    }
+
+    /**
+     * @param  array{hi:int,lo:int}  $word
+     */
+    private function extractBitsFromWord(array $word, int $bitOffset, int $bitCount): int
+    {
+        if ($bitCount <= 0) {
+            return 0;
+        }
+
+        $mask = (1 << $bitCount) - 1;
+
+        if ($bitOffset < 32) {
+            if (($bitOffset + $bitCount) <= 32) {
+                return ($word['lo'] >> $bitOffset) & $mask;
+            }
+
+            $lowBits = 32 - $bitOffset;
+            $lowMask = (1 << $lowBits) - 1;
+            $lowPart = ($word['lo'] >> $bitOffset) & $lowMask;
+            $highBits = $bitCount - $lowBits;
+            $highMask = (1 << $highBits) - 1;
+            $highPart = $word['hi'] & $highMask;
+
+            return $lowPart | ($highPart << $lowBits);
+        }
+
+        $highOffset = $bitOffset - 32;
+
+        return ($word['hi'] >> $highOffset) & $mask;
+    }
+
+    /**
+     * @param  array<int, int>  $depthBuffer
+     */
+    private function plotPixelIfCloser(
+        \GdImage $image,
+        array &$depthBuffer,
+        int $imageWidth,
+        int $x,
+        int $y,
+        int $color,
+        int $depth
+    ): void {
+        if ($x < 0 || $y < 0) {
+            return;
+        }
+
+        $imageHeight = imagesy($image);
+
+        if ($x >= $imageWidth || $y >= $imageHeight) {
+            return;
+        }
+
+        $bufferIndex = ($y * $imageWidth) + $x;
+
+        if (($depthBuffer[$bufferIndex] ?? PHP_INT_MIN) > $depth) {
+            return;
+        }
+
+        $depthBuffer[$bufferIndex] = $depth;
+        imagesetpixel($image, $x, $y, $color);
+    }
+
+    /**
+     * @param  array<int, int>  $cache
+     */
+    private function colorHandle(\GdImage $image, array &$cache, int $r, int $g, int $b, int $a): int
+    {
+        $r = max(0, min(255, $r));
+        $g = max(0, min(255, $g));
+        $b = max(0, min(255, $b));
+        $a = max(0, min(127, $a));
+        $key = ($a << 24) | ($r << 16) | ($g << 8) | $b;
+
+        if (! array_key_exists($key, $cache)) {
+            $cache[$key] = imagecolorallocatealpha($image, $r, $g, $b, $a);
+        }
+
+        return $cache[$key];
+    }
+
+    /**
+     * @param  array<string, array<int, array<string, mixed>>>  $sectionsByChunk
+     * @param  array<int, int>  $depthBuffer
+     * @param  array<int, int>  $colorCache
+     */
+    private function renderPhysicalShadow(
+        \GdImage $image,
+        array &$depthBuffer,
+        array &$colorCache,
+        array $sectionsByChunk,
+        int $isoWidth,
+        int $sourceHeight,
+        int $verticalDepthPadding,
+        int $worldX,
+        int $worldY,
+        int $worldZ,
+        int $minY,
+        int $maxY
+    ): void {
+        $airDepth = 0;
+        $targetY = null;
+
+        for ($scanY = $worldY - 1; $scanY >= $minY; $scanY--) {
+            if ($this->isSolidAt($sectionsByChunk, $worldX, $scanY, $worldZ, $minY, $maxY)) {
+                if ($airDepth >= 2) {
+                    $targetY = $scanY;
+                }
+
+                break;
+            }
+
+            $airDepth++;
+        }
+
+        if ($targetY === null) {
+            return;
+        }
+
+        $underlayColor = $this->colorAt($sectionsByChunk, $worldX, $targetY, $worldZ);
+
+        if ($underlayColor === null) {
+            return;
+        }
+
+        [$ur, $ug, $ub] = $underlayColor;
+        $isoX = ($worldX - $worldZ) + ($sourceHeight - 1);
+        $underlayDepthOffset = $this->depthOffsetForHeight($targetY + 1);
+        $underlayIsoY = (int) floor(($worldX + $worldZ) / 2) + $verticalDepthPadding - $underlayDepthOffset;
+        $depth = (($worldX + $worldZ) * 8192) + ($targetY * 4) + 4;
+        $shadowColor = $this->colorHandle(
+            $image,
+            $colorCache,
+            (int) round($ur * 0.45),
+            (int) round($ug * 0.45),
+            (int) round($ub * 0.45),
+            80
+        );
+
+        $this->plotPixelIfCloser($image, $depthBuffer, $isoWidth, $isoX, $underlayIsoY, $shadowColor, $depth);
     }
 }

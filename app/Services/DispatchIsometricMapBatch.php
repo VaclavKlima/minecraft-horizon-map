@@ -2,10 +2,8 @@
 
 namespace App\Services;
 
-use App\Jobs\GenerateCombinedIsometricTilesJob;
 use App\Jobs\GenerateRegionIsometricTilesJob;
 use App\Jobs\RenderRegionIsometricImageJob;
-use Illuminate\Bus\Batch;
 use Illuminate\Support\Facades\Bus;
 use RuntimeException;
 
@@ -33,7 +31,7 @@ class DispatchIsometricMapBatch
 
         $regionsToQueue = array_values(array_filter(
             $regionFiles,
-            fn (string $regionFile): bool => $this->minecraftIsometricRenderer->regionNeedsRendering($regionFile)
+            fn (string $regionFile): bool => $this->minecraftIsometricRenderer->regionNeedsRendering($regionFile, $heightmapType)
         ));
 
         if ($regionsToQueue === []) {
@@ -52,9 +50,6 @@ class DispatchIsometricMapBatch
         $batch = Bus::batch($jobs)
             ->name('Render Minecraft isometric map')
             ->allowFailures()
-            ->finally(static function (Batch $batch): void {
-                GenerateCombinedIsometricTilesJob::dispatch();
-            })
             ->dispatch();
 
         return [

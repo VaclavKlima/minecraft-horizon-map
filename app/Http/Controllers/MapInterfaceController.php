@@ -29,7 +29,7 @@ class MapInterfaceController extends Controller
 
         try {
             $manifest = $projection === 'isometric'
-                ? $this->minecraftIsometricTileService->getManifest($region !== '' ? $region : null, false)
+                ? $this->minecraftIsometricTileService->getManifest($region !== '' ? $region : null, true)
                 : $this->minecraftMapTileService->getManifest($region !== '' ? $region : null);
         } catch (RuntimeException $exception) {
             return response()->json([

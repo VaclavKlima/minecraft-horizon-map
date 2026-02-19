@@ -11,8 +11,6 @@ class GenerateRegionIsometricTilesJob implements ShouldQueue
 {
     use Batchable, Queueable;
 
-    public int $timeout = 1200;
-
     public int $tries = 1;
 
     public function __construct(public string $regionFile) {}

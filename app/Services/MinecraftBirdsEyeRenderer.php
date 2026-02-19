@@ -7,7 +7,7 @@ use RuntimeException;
 
 class MinecraftBirdsEyeRenderer
 {
-    private const RENDER_METADATA_VERSION = 5;
+    private const RENDER_METADATA_VERSION = 7;
 
     public function __construct(private Filesystem $files, private MinecraftRegionReader $minecraftRegionReader) {}
 
@@ -110,6 +110,120 @@ class MinecraftBirdsEyeRenderer
         return $rendered;
     }
 
+    /**
+     * @return array{
+     *     region_file:string,
+     *     width_blocks:int,
+     *     height_blocks:int,
+     *     chunk_count:int,
+     *     prepared_chunks:array<int, array{
+     *         chunk_x:int,
+     *         chunk_z:int,
+     *         heights:array<int, int>,
+     *         colors:array<int, array{0:int,1:int,2:int}>,
+     *         thicknesses:array<int, int>,
+     *         surface_masks:array<int, int>,
+     *         voxel_colors:array<int, int>,
+     *         underlay_heights:array<int, int>,
+     *         underlay_colors:array<int, int>
+     *     }>
+     * }|null
+     */
+    public function buildRegionVoxelSnapshot(string $regionFile, string $heightmapType = 'WORLD_SURFACE'): ?array
+    {
+        $regionPath = public_path('region'.DIRECTORY_SEPARATOR.$regionFile);
+
+        if (! $this->files->exists($regionPath)) {
+            throw new RuntimeException("Region file not found: {$regionFile}");
+        }
+
+        $binary = $this->files->get($regionPath);
+        $preparedChunks = $this->extractPreparedChunksFromBinary($binary, $heightmapType);
+
+        if ($preparedChunks === null) {
+            return null;
+        }
+
+        return [
+            'region_file' => $regionFile,
+            'width_blocks' => 32 * 16,
+            'height_blocks' => 32 * 16,
+            'chunk_count' => count($preparedChunks),
+            'prepared_chunks' => $preparedChunks,
+        ];
+    }
+
+    /**
+     * @return array{
+     *     region_file:string,
+     *     width_blocks:int,
+     *     height_blocks:int,
+     *     chunk_count:int,
+     *     chunks:array<int, array{
+     *         chunk_x:int,
+     *         chunk_z:int,
+     *         sections:array<int, array<string, mixed>>
+     *     }>
+     * }|null
+     */
+    public function buildRegionSectionSnapshot(string $regionFile): ?array
+    {
+        $regionPath = public_path('region'.DIRECTORY_SEPARATOR.$regionFile);
+
+        if (! $this->files->exists($regionPath)) {
+            throw new RuntimeException("Region file not found: {$regionFile}");
+        }
+
+        $binary = $this->files->get($regionPath);
+
+        if (strlen($binary) < 8192) {
+            return null;
+        }
+
+        $locationHeader = substr($binary, 0, 4096);
+        $chunks = [];
+
+        for ($index = 0; $index < 1024; $index++) {
+            $locationEntry = substr($locationHeader, $index * 4, 4);
+            $offset = unpack('N', "\x00".substr($locationEntry, 0, 3))[1];
+            $sectorCount = ord($locationEntry[3]);
+
+            if ($offset === 0 || $sectorCount === 0) {
+                continue;
+            }
+
+            $chunkBinary = $this->readChunkPayload($binary, $offset);
+
+            if ($chunkBinary === null) {
+                continue;
+            }
+
+            $sections = $this->parseChunkSections($chunkBinary);
+
+            if ($sections === []) {
+                continue;
+            }
+
+            $chunks[] = [
+                'chunk_x' => $index % 32,
+                'chunk_z' => intdiv($index, 32),
+                'sections' => $sections,
+            ];
+        }
+
+        if ($chunks === []) {
+            return null;
+        }
+
+        return [
+            'region_file' => $regionFile,
+            'width_blocks' => 32 * 16,
+            'height_blocks' => 32 * 16,
+            'chunk_count' => count($chunks),
+            'chunks' => $chunks,
+        ];
+    }
+
     public function regionNeedsRendering(string $regionFile, string $heightmapType = 'WORLD_SURFACE'): bool
     {
         $regionPath = public_path('region'.DIRECTORY_SEPARATOR.$regionFile);
@@ -118,6 +232,8 @@ class MinecraftBirdsEyeRenderer
         $heightMapPath = $this->regionHeightMapPath($regionFile);
         $surfaceMapPath = $this->regionSurfaceMaskPath($regionFile);
         $voxelMapPath = $this->regionVoxelColorPath($regionFile);
+        $underlayHeightMapPath = $this->regionUnderlayHeightMapPath($regionFile);
+        $underlayColorMapPath = $this->regionUnderlayColorMapPath($regionFile);
 
         if (
             ! $this->files->exists($regionPath)
@@ -126,6 +242,8 @@ class MinecraftBirdsEyeRenderer
             || ! $this->files->exists($heightMapPath)
             || ! $this->files->exists($surfaceMapPath)
             || ! $this->files->exists($voxelMapPath)
+            || ! $this->files->exists($underlayHeightMapPath)
+            || ! $this->files->exists($underlayColorMapPath)
         ) {
             return true;
         }
@@ -156,60 +274,24 @@ class MinecraftBirdsEyeRenderer
      */
     private function renderSingleRegion(string $regionFile, string $binary, string $heightmapType): ?array
     {
-        if (strlen($binary) < 8192) {
+        $preparedChunks = $this->extractPreparedChunksFromBinary($binary, $heightmapType);
+
+        if ($preparedChunks === null) {
             return null;
         }
 
-        $locationHeader = substr($binary, 0, 4096);
-        $preparedChunks = [];
-        $minHeight = null;
-        $maxHeight = null;
+        $allHeights = [];
 
-        for ($index = 0; $index < 1024; $index++) {
-            $locationEntry = substr($locationHeader, $index * 4, 4);
-            $offset = unpack('N', "\x00".substr($locationEntry, 0, 3))[1];
-            $sectorCount = ord($locationEntry[3]);
-
-            if ($offset === 0 || $sectorCount === 0) {
-                continue;
-            }
-
-            $chunkBinary = $this->readChunkPayload($binary, $offset);
-
-            if ($chunkBinary === null) {
-                continue;
-            }
-
-            try {
-                $chunkData = $this->parseModernChunk($chunkBinary, $heightmapType);
-            } catch (RuntimeException) {
-                continue;
-            }
-
-            if ($chunkData === null) {
-                continue;
-            }
-
-            $localChunkX = $index % 32;
-            $localChunkZ = intdiv($index, 32);
-            $preparedChunks[] = [
-                'chunk_x' => $localChunkX,
-                'chunk_z' => $localChunkZ,
-                'heights' => $chunkData['heights'],
-                'colors' => $chunkData['colors'],
-                'thicknesses' => $chunkData['thicknesses'],
-                'surface_masks' => $chunkData['surface_masks'],
-                'voxel_colors' => $chunkData['voxel_colors'],
-            ];
-            $chunkMinHeight = min($chunkData['heights']);
-            $chunkMaxHeight = max($chunkData['heights']);
-            $minHeight = $minHeight === null ? $chunkMinHeight : min($minHeight, $chunkMinHeight);
-            $maxHeight = $maxHeight === null ? $chunkMaxHeight : max($maxHeight, $chunkMaxHeight);
+        foreach ($preparedChunks as $chunk) {
+            array_push($allHeights, ...$chunk['heights']);
         }
 
-        if ($preparedChunks === [] || $minHeight === null || $maxHeight === null) {
+        if ($allHeights === []) {
             return null;
         }
+
+        $minHeight = (float) min($allHeights);
+        $maxHeight = (float) max($allHeights);
 
         $widthBlocks = 32 * 16;
         $heightBlocks = 32 * 16;
@@ -267,6 +349,8 @@ class MinecraftBirdsEyeRenderer
         $this->writeRegionThicknessMap($regionFile, $preparedChunks);
         $this->writeRegionSurfaceMaskMap($regionFile, $preparedChunks);
         $this->writeRegionVoxelColorMap($regionFile, $preparedChunks);
+        $this->writeRegionUnderlayHeightMap($regionFile, $preparedChunks);
+        $this->writeRegionUnderlayColorMap($regionFile, $preparedChunks);
 
         return [
             'region_file' => $regionFile,
@@ -278,6 +362,116 @@ class MinecraftBirdsEyeRenderer
             'max_height' => $maxHeight,
             'chunk_count' => count($preparedChunks),
         ];
+    }
+
+    /**
+     * @return array<int, array{
+     *     chunk_x:int,
+     *     chunk_z:int,
+     *     heights:array<int, int>,
+     *     colors:array<int, array{0:int,1:int,2:int}>,
+     *     thicknesses:array<int, int>,
+     *     surface_masks:array<int, int>,
+     *     voxel_colors:array<int, int>,
+     *     underlay_heights:array<int, int>,
+     *     underlay_colors:array<int, int>
+     * }>|null
+     */
+    private function extractPreparedChunksFromBinary(string $binary, string $heightmapType): ?array
+    {
+        if (strlen($binary) < 8192) {
+            return null;
+        }
+
+        $locationHeader = substr($binary, 0, 4096);
+        $preparedChunks = [];
+
+        for ($index = 0; $index < 1024; $index++) {
+            $locationEntry = substr($locationHeader, $index * 4, 4);
+            $offset = unpack('N', "\x00".substr($locationEntry, 0, 3))[1];
+            $sectorCount = ord($locationEntry[3]);
+
+            if ($offset === 0 || $sectorCount === 0) {
+                continue;
+            }
+
+            $chunkBinary = $this->readChunkPayload($binary, $offset);
+
+            if ($chunkBinary === null) {
+                continue;
+            }
+
+            try {
+                $chunkData = $this->parseModernChunk($chunkBinary, $heightmapType);
+            } catch (RuntimeException) {
+                continue;
+            }
+
+            if ($chunkData === null) {
+                continue;
+            }
+
+            $localChunkX = $index % 32;
+            $localChunkZ = intdiv($index, 32);
+            $preparedChunks[] = [
+                'chunk_x' => $localChunkX,
+                'chunk_z' => $localChunkZ,
+                'heights' => $chunkData['heights'],
+                'colors' => $chunkData['colors'],
+                'thicknesses' => $chunkData['thicknesses'],
+                'surface_masks' => $chunkData['surface_masks'],
+                'voxel_colors' => $chunkData['voxel_colors'],
+                'underlay_heights' => $chunkData['underlay_heights'],
+                'underlay_colors' => $chunkData['underlay_colors'],
+            ];
+        }
+
+        return $preparedChunks === [] ? null : $preparedChunks;
+    }
+
+    /**
+     * @return array<int, array<string, mixed>>
+     */
+    private function parseChunkSections(string $chunkNbtBinary): array
+    {
+        $cursor = 0;
+
+        if ($this->readUnsignedByte($chunkNbtBinary, $cursor) !== 10) {
+            return [];
+        }
+
+        $this->readString($chunkNbtBinary, $cursor);
+        $sections = [];
+
+        while (true) {
+            $tagType = $this->readUnsignedByte($chunkNbtBinary, $cursor);
+
+            if ($tagType === 0) {
+                break;
+            }
+
+            $tagName = $this->readString($chunkNbtBinary, $cursor);
+
+            if ($tagName === 'sections' && $tagType === 9) {
+                $sections = $this->readSectionsList($chunkNbtBinary, $cursor);
+
+                continue;
+            }
+
+            if ($tagName === 'Level' && $tagType === 10) {
+                [, $levelSections] = $this->readLevelCompoundModern($chunkNbtBinary, $cursor);
+
+                if ($sections === [] && $levelSections !== []) {
+                    $sections = $levelSections;
+                }
+
+                continue;
+            }
+
+            $this->skipTagPayload($tagType, $chunkNbtBinary, $cursor);
+        }
+
+        return $sections;
     }
 
     /**
@@ -427,6 +621,8 @@ class MinecraftBirdsEyeRenderer
      *     thicknesses: array<int, int>,
      *     surface_masks: array<int, int>,
      *     voxel_colors: array<int, int>,
+     *     underlay_heights: array<int, int>,
+     *     underlay_colors: array<int, int>,
      *     chunk_x?: int,
      *     chunk_z?: int
      * }|null
@@ -504,7 +700,7 @@ class MinecraftBirdsEyeRenderer
             return null;
         }
 
-        [$heights, $colors, $thicknesses, $surfaceMasks, $voxelColors] = $this->resolveTopSurface($sections, $heightmaps[$heightmapType] ?? null);
+        [$heights, $colors, $thicknesses, $surfaceMasks, $voxelColors, $underlayHeights, $underlayColors] = $this->resolveTopSurface($sections, $heightmaps[$heightmapType] ?? null);
 
         return [
             'heights' => $heights,
@@ -512,6 +708,8 @@ class MinecraftBirdsEyeRenderer
             'thicknesses' => $thicknesses,
             'surface_masks' => $surfaceMasks,
             'voxel_colors' => $voxelColors,
+            'underlay_heights' => $underlayHeights,
+            'underlay_colors' => $underlayColors,
             'chunk_x' => $chunkX,
             'chunk_z' => $chunkZ,
         ];
@@ -794,7 +992,15 @@ class MinecraftBirdsEyeRenderer
     /**
      * @param  array<int, array<string, mixed>>  $sections
      * @param  array<int, string>|null  $heightmap
-     * @return array{0: array<int, int>, 1: array<int, array{0:int,1:int,2:int}>, 2: array<int, int>, 3: array<int, int>, 4: array<int, int>}
+     * @return array{
+     *     0: array<int, int>,
+     *     1: array<int, array{0:int,1:int,2:int}>,
+     *     2: array<int, int>,
+     *     3: array<int, int>,
+     *     4: array<int, int>,
+     *     5: array<int, int>,
+     *     6: array<int, int>
+     * }
      */
     private function resolveTopSurface(array $sections, ?array $heightmap): array
     {
@@ -809,6 +1015,8 @@ class MinecraftBirdsEyeRenderer
         $thicknesses = array_fill(0, 256, 0);
         $surfaceMasks = array_fill(0, 256, 0);
         $voxelColors = array_fill(0, 256 * 24, 0);
+        $underlayHeights = array_fill(0, 256, 0);
+        $underlayColors = array_fill(0, 256, 0);
         $heightHints = $this->decodeHeightHints($heightmap, $minY, $maxY);
 
         for ($localZ = 0; $localZ < 16; $localZ++) {
@@ -842,6 +1050,9 @@ class MinecraftBirdsEyeRenderer
                         $thicknesses[$surfaceIndex] = $this->resolveColumnThickness($sections, $sectionY, $localTopY, $localX, $localZ);
                         $surfaceMasks[$surfaceIndex] = $this->buildSurfaceMask($sections, $sectionY, $localTopY, $localX, $localZ);
                         $this->writeColumnVoxelColors($voxelColors, $surfaceIndex, $this->resolveColumnVoxelColors($sections, $sectionY, $localTopY, $localX, $localZ));
+                        [$underlayHeight, $underlayColor] = $this->resolveColumnUnderlay($sections, $sectionY, $localTopY, $localX, $localZ);
+                        $underlayHeights[$surfaceIndex] = $underlayHeight;
+                        $underlayColors[$surfaceIndex] = $underlayColor;
                         break;
                     }
 
@@ -857,13 +1068,16 @@ class MinecraftBirdsEyeRenderer
                         $thicknesses[$surfaceIndex] = $this->resolveColumnThickness($sections, $sectionY, $yInSection, $localX, $localZ);
                         $surfaceMasks[$surfaceIndex] = $this->buildSurfaceMask($sections, $sectionY, $yInSection, $localX, $localZ);
                         $this->writeColumnVoxelColors($voxelColors, $surfaceIndex, $this->resolveColumnVoxelColors($sections, $sectionY, $yInSection, $localX, $localZ));
+                        [$underlayHeight, $underlayColor] = $this->resolveColumnUnderlay($sections, $sectionY, $yInSection, $localX, $localZ);
+                        $underlayHeights[$surfaceIndex] = $underlayHeight;
+                        $underlayColors[$surfaceIndex] = $underlayColor;
                         break 2;
                     }
                 }
             }
         }
 
-        return [$heights, $colors, $thicknesses, $surfaceMasks, $voxelColors];
+        return [$heights, $colors, $thicknesses, $surfaceMasks, $voxelColors, $underlayHeights, $underlayColors];
     }
 
     /**
@@ -909,6 +1123,7 @@ class MinecraftBirdsEyeRenderer
         $mask = 0;
         $currentSectionY = $startSectionY;
         $currentYInSection = $startYInSection;
+        $encounteredAirGap = false;
 
         for ($depth = 0; $depth < 24; $depth++) {
             if (! isset($sections[$currentSectionY])) {
@@ -918,8 +1133,16 @@ class MinecraftBirdsEyeRenderer
             $section = $sections[$currentSectionY];
             $paletteIndex = $this->paletteIndexAt($section, $localX, $localZ, $currentYInSection);
 
-            if (($section['palette_is_air'][$paletteIndex] ?? true) === false) {
+            $isSolid = ($section['palette_is_air'][$paletteIndex] ?? true) === false;
+
+            if ($isSolid) {
+                if ($encounteredAirGap) {
+                    break;
+                }
+
                 $mask |= (1 << $depth);
+            } else {
+                $encounteredAirGap = true;
             }
 
             $currentYInSection--;
@@ -942,6 +1165,7 @@ class MinecraftBirdsEyeRenderer
         $colors = array_fill(0, 24, 0);
         $currentSectionY = $startSectionY;
         $currentYInSection = $startYInSection;
+        $encounteredAirGap = false;
 
         for ($depth = 0; $depth < 24; $depth++) {
             if (! isset($sections[$currentSectionY])) {
@@ -951,9 +1175,17 @@ class MinecraftBirdsEyeRenderer
             $section = $sections[$currentSectionY];
             $paletteIndex = $this->paletteIndexAt($section, $localX, $localZ, $currentYInSection);
 
-            if (($section['palette_is_air'][$paletteIndex] ?? true) === false) {
+            $isSolid = ($section['palette_is_air'][$paletteIndex] ?? true) === false;
+
+            if ($isSolid) {
+                if ($encounteredAirGap) {
+                    break;
+                }
+
                 [$red, $green, $blue] = $section['palette_colors'][$paletteIndex] ?? [90, 90, 92];
                 $colors[$depth] = $this->packRgb($red, $green, $blue);
+            } else {
+                $encounteredAirGap = true;
             }
 
             $currentYInSection--;
@@ -983,6 +1215,77 @@ class MinecraftBirdsEyeRenderer
     private function packRgb(int $red, int $green, int $blue): int
     {
         return (($red & 0xFF) << 16) | (($green & 0xFF) << 8) | ($blue & 0xFF);
+    }
+
+    /**
+     * @param  array<int, array<string, mixed>>  $sections
+     * @return array{0:int, 1:int}
+     */
+    private function resolveColumnUnderlay(array $sections, int $startSectionY, int $startYInSection, int $localX, int $localZ): array
+    {
+        $currentSectionY = $startSectionY;
+        $currentYInSection = $startYInSection;
+        $topWorldY = ($startSectionY * 16) + $startYInSection;
+        $phase = 'top_solid';
+        $sectionYs = array_keys($sections);
+        $minSectionY = (int) min($sectionYs);
+
+        while ($currentSectionY >= $minSectionY) {
+            if (! isset($sections[$currentSectionY])) {
+                if ($phase === 'top_solid') {
+                    $phase = 'air_gap';
+                }
+
+                $currentSectionY--;
+                $currentYInSection = 15;
+
+                continue;
+            }
+
+            $section = $sections[$currentSectionY];
+
+            while ($currentYInSection >= 0) {
+                $paletteIndex = $this->paletteIndexAt($section, $localX, $localZ, $currentYInSection);
+                $isSolid = ($section['palette_is_air'][$paletteIndex] ?? true) === false;
+
+                if ($phase === 'top_solid') {
+                    if ($isSolid) {
+                        $currentYInSection--;
+
+                        continue;
+                    }
+
+                    $phase = 'air_gap';
+                    $currentYInSection--;
+
+                    continue;
+                }
+
+                if ($phase === 'air_gap') {
+                    if (! $isSolid) {
+                        $currentYInSection--;
+
+                        continue;
+                    }
+
+                    [$red, $green, $blue] = $section['palette_colors'][$paletteIndex] ?? [90, 90, 92];
+                    $worldY = ($currentSectionY * 16) + $currentYInSection;
+                    $height = $worldY + 1;
+                    $depthDelta = $topWorldY - $worldY;
+
+                    if ($depthDelta < 2) {
+                        return [0, 0];
+                    }
+
+                    return [$height, $this->packRgb($red, $green, $blue)];
+                }
+            }
+
+            $currentSectionY--;
+            $currentYInSection = 15;
+        }
+
+        return [0, 0];
     }
 
     /**
@@ -1109,7 +1412,7 @@ class MinecraftBirdsEyeRenderer
 
     private function isAirLikeBlock(string $blockName): bool
     {
-        return str_contains($blockName, 'air');
+        return in_array($blockName, ['minecraft:air', 'minecraft:cave_air', 'minecraft:void_air'], true);
     }
 
     private function floorDivide(int $value, int $divisor): int
@@ -1478,7 +1781,9 @@ class MinecraftBirdsEyeRenderer
      *     colors:array<int, array{0:int,1:int,2:int}>,
      *     thicknesses:array<int, int>,
      *     surface_masks:array<int, int>,
-     *     voxel_colors:array<int, int>
+     *     voxel_colors:array<int, int>,
+     *     underlay_heights:array<int, int>,
+     *     underlay_colors:array<int, int>
      * }>  $preparedChunks
      */
     private function writeRegionHeightMap(string $regionFile, array $preparedChunks): void
@@ -1528,7 +1833,9 @@ class MinecraftBirdsEyeRenderer
      *     colors:array<int, array{0:int,1:int,2:int}>,
      *     thicknesses:array<int, int>,
      *     surface_masks:array<int, int>,
-     *     voxel_colors:array<int, int>
+     *     voxel_colors:array<int, int>,
+     *     underlay_heights:array<int, int>,
+     *     underlay_colors:array<int, int>
      * }>  $preparedChunks
      */
     private function writeRegionThicknessMap(string $regionFile, array $preparedChunks): void
@@ -1575,7 +1882,9 @@ class MinecraftBirdsEyeRenderer
      *     colors:array<int, array{0:int,1:int,2:int}>,
      *     thicknesses:array<int, int>,
      *     surface_masks:array<int, int>,
-     *     voxel_colors:array<int, int>
+     *     voxel_colors:array<int, int>,
+     *     underlay_heights:array<int, int>,
+     *     underlay_colors:array<int, int>
      * }>  $preparedChunks
      */
     private function writeRegionSurfaceMaskMap(string $regionFile, array $preparedChunks): void
@@ -1625,7 +1934,9 @@ class MinecraftBirdsEyeRenderer
      *     colors:array<int, array{0:int,1:int,2:int}>,
      *     thicknesses:array<int, int>,
      *     surface_masks:array<int, int>,
-     *     voxel_colors:array<int, int>
+     *     voxel_colors:array<int, int>,
+     *     underlay_heights:array<int, int>,
+     *     underlay_colors:array<int, int>
      * }>  $preparedChunks
      */
     private function writeRegionVoxelColorMap(string $regionFile, array $preparedChunks): void
@@ -1670,5 +1981,105 @@ class MinecraftBirdsEyeRenderer
     private function regionVoxelColorPath(string $regionFile): string
     {
         return public_path('maps/regions'.DIRECTORY_SEPARATOR.'.voxels'.DIRECTORY_SEPARATOR.str_replace('.mca', '.bin', $regionFile));
+    }
+
+    /**
+     * @param  array<int, array{
+     *     chunk_x:int,
+     *     chunk_z:int,
+     *     heights:array<int, int>,
+     *     colors:array<int, array{0:int,1:int,2:int}>,
+     *     thicknesses:array<int, int>,
+     *     surface_masks:array<int, int>,
+     *     voxel_colors:array<int, int>,
+     *     underlay_heights:array<int, int>,
+     *     underlay_colors:array<int, int>
+     * }>  $preparedChunks
+     */
+    private function writeRegionUnderlayHeightMap(string $regionFile, array $preparedChunks): void
+    {
+        $widthBlocks = 32 * 16;
+        $heightBlocks = 32 * 16;
+        $image = imagecreatetruecolor($widthBlocks, $heightBlocks);
+
+        if ($image === false) {
+            throw new RuntimeException('Unable to allocate region underlay height map image.');
+        }
+
+        foreach ($preparedChunks as $chunk) {
+            $basePixelX = $chunk['chunk_x'] * 16;
+            $basePixelZ = $chunk['chunk_z'] * 16;
+            $heights = $chunk['underlay_heights'];
+
+            for ($localZ = 0; $localZ < 16; $localZ++) {
+                for ($localX = 0; $localX < 16; $localX++) {
+                    $index = ($localZ * 16) + $localX;
+                    $heightValue = $heights[$index];
+                    $encodedHeight = $heightValue + 32768;
+                    $red = ($encodedHeight >> 8) & 0xFF;
+                    $green = $encodedHeight & 0xFF;
+                    $color = ($red << 16) | ($green << 8);
+                    imagesetpixel($image, $basePixelX + $localX, $basePixelZ + $localZ, $color);
+                }
+            }
+        }
+
+        $path = $this->regionUnderlayHeightMapPath($regionFile);
+        $this->files->ensureDirectoryExists(dirname($path));
+        imagepng($image, $path);
+        imagedestroy($image);
+    }
+
+    /**
+     * @param  array<int, array{
+     *     chunk_x:int,
+     *     chunk_z:int,
+     *     heights:array<int, int>,
+     *     colors:array<int, array{0:int,1:int,2:int}>,
+     *     thicknesses:array<int, int>,
+     *     surface_masks:array<int, int>,
+     *     voxel_colors:array<int, int>,
+     *     underlay_heights:array<int, int>,
+     *     underlay_colors:array<int, int>
+     * }>  $preparedChunks
+     */
+    private function writeRegionUnderlayColorMap(string $regionFile, array $preparedChunks): void
+    {
+        $widthBlocks = 32 * 16;
+        $heightBlocks = 32 * 16;
+        $image = imagecreatetruecolor($widthBlocks, $heightBlocks);
+
+        if ($image === false) {
+            throw new RuntimeException('Unable to allocate region underlay color map image.');
+        }
+
+        foreach ($preparedChunks as $chunk) {
+            $basePixelX = $chunk['chunk_x'] * 16;
+            $basePixelZ = $chunk['chunk_z'] * 16;
+            $colors = $chunk['underlay_colors'];
+
+            for ($localZ = 0; $localZ < 16; $localZ++) {
+                for ($localX = 0; $localX < 16; $localX++) {
+                    $index = ($localZ * 16) + $localX;
+                    $color = $colors[$index];
+                    imagesetpixel($image, $basePixelX + $localX, $basePixelZ + $localZ, $color);
+                }
+            }
+        }
+
+        $path = $this->regionUnderlayColorMapPath($regionFile);
+        $this->files->ensureDirectoryExists(dirname($path));
+        imagepng($image, $path);
+        imagedestroy($image);
+    }
+
+    private function regionUnderlayHeightMapPath(string $regionFile): string
+    {
+        return public_path('maps/regions'.DIRECTORY_SEPARATOR.'.underlay_heights'.DIRECTORY_SEPARATOR.str_replace('.mca', '.png', $regionFile));
+    }
+
+    private function regionUnderlayColorMapPath(string $regionFile): string
+    {
+        return public_path('maps/regions'.DIRECTORY_SEPARATOR.'.underlay_colors'.DIRECTORY_SEPARATOR.str_replace('.mca', '.png', $regionFile));
     }
 }
