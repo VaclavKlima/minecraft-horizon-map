@@ -7,7 +7,7 @@ use RuntimeException;
 
 class MinecraftIsometricRenderer
 {
-    private const RENDER_METADATA_VERSION = 16;
+    private const RENDER_METADATA_VERSION = 17;
 
     private const DEPTH_SCALE = 0.6;
 
@@ -33,13 +33,12 @@ class MinecraftIsometricRenderer
     {
         $sourceWidth = 32 * 16;
         $sourceHeight = 32 * 16;
-        [$columns, $minY, $maxY, $chunkCount] = $this->buildSolidColumns($regionFile, $sourceWidth, $sourceHeight);
+        [$volume, $minY, $maxY, $heightSpan, $columnRuns, $chunkCount] = $this->buildPackedVoxelVolume($regionFile, $sourceWidth, $sourceHeight);
 
-        if ($chunkCount === 0 || $columns === [] || $minY === null || $maxY === null) {
+        if ($chunkCount === 0 || $volume === null || $minY === null || $maxY === null) {
             return null;
         }
 
-        $heightSpan = max(1, $maxY - $minY + 1);
         $verticalDepthPadding = (int) ceil($heightSpan * self::DEPTH_SCALE);
         $isoWidth = $sourceWidth + $sourceHeight;
         $isoHeight = (int) ceil(($sourceWidth + $sourceHeight) / 2) + $verticalDepthPadding + 8;
@@ -56,90 +55,122 @@ class MinecraftIsometricRenderer
 
         $colorCache = [];
         $depthBuffer = array_fill(0, $isoWidth * $isoHeight, PHP_INT_MIN);
+        $totalColumns = $sourceWidth * $sourceHeight;
+        $depthOffsetsByY = [];
 
-        foreach ($columns as $columnIndex => $column) {
+        for ($worldY = $minY; $worldY <= $maxY; $worldY++) {
+            $depthOffsetsByY[$worldY] = $this->depthOffsetForHeight($worldY + 1);
+        }
+
+        $columnIsoBase = [];
+
+        for ($columnIndex = 0; $columnIndex < $totalColumns; $columnIndex++) {
             $worldX = $columnIndex % $sourceWidth;
             $worldZ = intdiv($columnIndex, $sourceWidth);
-            $eastColumn = ($worldX + 1 < $sourceWidth) ? ($columns[$columnIndex + 1] ?? null) : null;
-            $southColumn = ($worldZ + 1 < $sourceHeight) ? ($columns[$columnIndex + $sourceWidth] ?? null) : null;
-            $columnYs = $column['ys'];
-            $columnColors = $column['colors'];
-            $eastYs = $eastColumn['ys'] ?? [];
-            $southYs = $southColumn['ys'] ?? [];
+            $columnIsoBase[$columnIndex] = (int) floor(($worldX + $worldZ) / 2) + $verticalDepthPadding;
+        }
 
-            foreach ($columnYs as $index => $worldY) {
-                $topExposed = ! $this->containsY($columnYs, $worldY + 1);
-                $eastExposed = ! $this->containsY($eastYs, $worldY);
-                $southExposed = ! $this->containsY($southYs, $worldY);
+        for ($columnIndex = 0; $columnIndex < $totalColumns; $columnIndex++) {
+            if (! isset($columnRuns[$columnIndex])) {
+                continue;
+            }
 
-                if (! $topExposed && ! $eastExposed && ! $southExposed) {
-                    continue;
+            $worldX = $columnIndex % $sourceWidth;
+            $worldZ = intdiv($columnIndex, $sourceWidth);
+            $eastColumnIndex = $columnIndex + 1;
+            $southColumnIndex = $columnIndex + $sourceWidth;
+            $isoBaseY = $columnIsoBase[$columnIndex];
+            $runs = $columnRuns[$columnIndex];
+            $pendingShadowSourceY = null;
+
+            for ($runIndex = 0; $runIndex < count($runs); $runIndex += 2) {
+                $runTop = $runs[$runIndex];
+                $runBottom = $runs[$runIndex + 1];
+
+                if ($pendingShadowSourceY !== null) {
+                    $targetYOffset = $runTop - $minY;
+                    $targetVoxelIndex = ($columnIndex * $heightSpan) + $targetYOffset;
+                    $underlayColor = $this->packedColorAt($volume['colors'], $targetVoxelIndex);
+                    $red = ($underlayColor >> 16) & 0xFF;
+                    $green = ($underlayColor >> 8) & 0xFF;
+                    $blue = $underlayColor & 0xFF;
+                    $shadowGap = $pendingShadowSourceY - $runTop;
+
+                    if ($shadowGap >= 2 && ($red !== 0 || $green !== 0 || $blue !== 0)) {
+                        $isoX = ($worldX - $worldZ) + ($sourceHeight - 1);
+                        $underlayIsoY = $isoBaseY - $depthOffsetsByY[$runTop];
+                        $shadowDepth = (($worldX + $worldZ) * 8192) + ($runTop * 4) + 4;
+                        $shadowColor = $this->colorHandle(
+                            $isometricImage,
+                            $colorCache,
+                            (int) round($red * 0.45),
+                            (int) round($green * 0.45),
+                            (int) round($blue * 0.45),
+                            80
+                        );
+
+                        $this->plotPixelIfCloser($isometricImage, $depthBuffer, $isoWidth, $isoX, $underlayIsoY, $shadowColor, $shadowDepth);
+                    }
+
+                    $pendingShadowSourceY = null;
                 }
 
-                $packedColor = $columnColors[$index] ?? 0;
-                $red = ($packedColor >> 16) & 0xFF;
-                $green = ($packedColor >> 8) & 0xFF;
-                $blue = $packedColor & 0xFF;
-                $topColor = $this->colorHandle($isometricImage, $colorCache, $red, $green, $blue, 0);
+                $topYOffset = $runTop - $minY;
+                $topVoxelIndex = ($columnIndex * $heightSpan) + $topYOffset;
+                $topPackedColor = $this->packedColorAt($volume['colors'], $topVoxelIndex);
+                $topRed = ($topPackedColor >> 16) & 0xFF;
+                $topGreen = ($topPackedColor >> 8) & 0xFF;
+                $topBlue = $topPackedColor & 0xFF;
                 $isoX = ($worldX - $worldZ) + ($sourceHeight - 1);
-                $depthOffset = $this->depthOffsetForHeight($worldY + 1);
-                $isoY = (int) floor(($worldX + $worldZ) / 2) + $verticalDepthPadding - $depthOffset;
-                $baseDepth = (($worldX + $worldZ) * 8192) + ($worldY * 4);
+                $isoY = $isoBaseY - $depthOffsetsByY[$runTop];
+                $baseDepth = (($worldX + $worldZ) * 8192) + ($runTop * 4);
+                $topColor = $this->colorHandle($isometricImage, $colorCache, $topRed, $topGreen, $topBlue, 0);
+                $this->plotPixelIfCloser($isometricImage, $depthBuffer, $isoWidth, $isoX, $isoY, $topColor, $baseDepth + 3);
+                $pendingShadowSourceY = $runTop;
 
-                if ($topExposed) {
-                    $this->plotPixelIfCloser($isometricImage, $depthBuffer, $isoWidth, $isoX, $isoY, $topColor, $baseDepth + 3);
-                }
+                for ($worldY = $runTop; $worldY >= $runBottom; $worldY--) {
+                    $yOffset = $worldY - $minY;
+                    $eastExposed = $worldX + 1 >= $sourceWidth
+                        || ! $this->isSolidVoxel($volume['occupancy'], ($eastColumnIndex * $heightSpan) + $yOffset);
+                    $southExposed = $worldZ + 1 >= $sourceHeight
+                        || ! $this->isSolidVoxel($volume['occupancy'], ($southColumnIndex * $heightSpan) + $yOffset);
 
-                if ($eastExposed) {
-                    $eastColor = $this->colorHandle(
-                        $isometricImage,
-                        $colorCache,
-                        (int) round($red * 0.8),
-                        (int) round($green * 0.8),
-                        (int) round($blue * 0.8),
-                        0
-                    );
+                    if (! $eastExposed && ! $southExposed) {
+                        continue;
+                    }
 
-                    $this->plotPixelIfCloser($isometricImage, $depthBuffer, $isoWidth, $isoX + 1, $isoY + 1, $eastColor, $baseDepth + 2);
-                }
+                    $voxelIndex = ($columnIndex * $heightSpan) + $yOffset;
+                    $packedColor = $this->packedColorAt($volume['colors'], $voxelIndex);
+                    $red = ($packedColor >> 16) & 0xFF;
+                    $green = ($packedColor >> 8) & 0xFF;
+                    $blue = $packedColor & 0xFF;
+                    $isoY = $isoBaseY - $depthOffsetsByY[$worldY];
+                    $baseDepth = (($worldX + $worldZ) * 8192) + ($worldY * 4);
 
-                if ($southExposed) {
-                    $southColor = $this->colorHandle(
-                        $isometricImage,
-                        $colorCache,
-                        (int) round($red * 0.72),
-                        (int) round($green * 0.72),
-                        (int) round($blue * 0.72),
-                        0
-                    );
+                    if ($eastExposed) {
+                        $eastColor = $this->colorHandle(
+                            $isometricImage,
+                            $colorCache,
+                            (int) round($red * 0.8),
+                            (int) round($green * 0.8),
+                            (int) round($blue * 0.8),
+                            0
+                        );
 
-                    $this->plotPixelIfCloser($isometricImage, $depthBuffer, $isoWidth, $isoX - 1, $isoY + 1, $southColor, $baseDepth + 1);
-                }
+                        $this->plotPixelIfCloser($isometricImage, $depthBuffer, $isoWidth, $isoX + 1, $isoY + 1, $eastColor, $baseDepth + 2);
+                    }
 
-                if ($topExposed) {
-                    $shadowTargetY = $columnYs[$index + 1] ?? null;
+                    if ($southExposed) {
+                        $southColor = $this->colorHandle(
+                            $isometricImage,
+                            $colorCache,
+                            (int) round($red * 0.72),
+                            (int) round($green * 0.72),
+                            (int) round($blue * 0.72),
+                            0
+                        );
 
-                    if (is_int($shadowTargetY) && ($worldY - $shadowTargetY) >= 2) {
-                        $underlayColor = $columnColors[$index + 1] ?? 0;
-                        $ur = ($underlayColor >> 16) & 0xFF;
-                        $ug = ($underlayColor >> 8) & 0xFF;
-                        $ub = $underlayColor & 0xFF;
-
-                        if ($ur !== 0 || $ug !== 0 || $ub !== 0) {
-                            $underlayDepthOffset = $this->depthOffsetForHeight($shadowTargetY + 1);
-                            $underlayIsoY = (int) floor(($worldX + $worldZ) / 2) + $verticalDepthPadding - $underlayDepthOffset;
-                            $shadowDepth = (($worldX + $worldZ) * 8192) + ($shadowTargetY * 4) + 4;
-                            $shadowColor = $this->colorHandle(
-                                $isometricImage,
-                                $colorCache,
-                                (int) round($ur * 0.45),
-                                (int) round($ug * 0.45),
-                                (int) round($ub * 0.45),
-                                80
-                            );
-
-                            $this->plotPixelIfCloser($isometricImage, $depthBuffer, $isoWidth, $isoX, $underlayIsoY, $shadowColor, $shadowDepth);
-                        }
+                        $this->plotPixelIfCloser($isometricImage, $depthBuffer, $isoWidth, $isoX - 1, $isoY + 1, $southColor, $baseDepth + 1);
                     }
                 }
             }
@@ -208,16 +239,22 @@ class MinecraftIsometricRenderer
     }
 
     /**
-     * @return array{0:array<int, array{ys:array<int, int>, colors:array<int, int>}>,1:?int,2:?int,3:int}
+     * @return array{
+     *   0:?array{occupancy:string,colors:string},
+     *   1:?int,
+     *   2:?int,
+     *   3:int,
+     *   4:array<int, array<int, int>>,
+     *   5:int
+     * }
      */
-    private function buildSolidColumns(string $regionFile, int $sourceWidth, int $sourceHeight): array
+    private function buildPackedVoxelVolume(string $regionFile, int $sourceWidth, int $sourceHeight): array
     {
-        $columns = [];
         $minY = null;
         $maxY = null;
-        $chunkCount = $this->minecraftBirdsEyeRenderer->iterateRegionSections(
+        $firstPassChunkCount = $this->minecraftBirdsEyeRenderer->iterateRegionSections(
             $regionFile,
-            function (int $chunkX, int $chunkZ, array $chunkSections) use (&$columns, &$minY, &$maxY, $sourceWidth, $sourceHeight): void {
+            function (int $chunkX, int $chunkZ, array $chunkSections) use (&$minY, &$maxY, $sourceWidth, $sourceHeight): void {
                 foreach ($chunkSections as $sectionY => $section) {
                     $uniformPaletteIndex = $section['uniform_palette_index'];
 
@@ -254,20 +291,6 @@ class MinecraftIsometricRenderer
 
                                 $minY = $minY === null ? $worldY : min($minY, $worldY);
                                 $maxY = $maxY === null ? $worldY : max($maxY, $worldY);
-
-                                [$red, $green, $blue] = $section['palette_colors'][$paletteIndex] ?? [90, 90, 92];
-                                $packedColor = (($red & 0xFF) << 16) | (($green & 0xFF) << 8) | ($blue & 0xFF);
-                                $columnIndex = ($worldZ * $sourceWidth) + $worldX;
-
-                                if (! isset($columns[$columnIndex])) {
-                                    $columns[$columnIndex] = [
-                                        'ys' => [],
-                                        'colors' => [],
-                                    ];
-                                }
-
-                                $columns[$columnIndex]['ys'][] = $worldY;
-                                $columns[$columnIndex]['colors'][] = $packedColor;
                             }
                         }
                     }
@@ -275,43 +298,181 @@ class MinecraftIsometricRenderer
             }
         );
 
-        foreach ($columns as &$column) {
-            if (count($column['ys']) <= 1) {
-                continue;
-            }
-
-            array_multisort($column['ys'], SORT_DESC, SORT_NUMERIC, $column['colors']);
+        if ($firstPassChunkCount === 0 || $minY === null || $maxY === null) {
+            return [null, null, null, 0, [], 0];
         }
 
-        unset($column);
+        $heightSpan = max(1, $maxY - $minY + 1);
+        $totalColumns = $sourceWidth * $sourceHeight;
+        $totalVoxels = $totalColumns * $heightSpan;
+        $occupancy = str_repeat("\0", intdiv($totalVoxels + 7, 8));
+        $colors = str_repeat("\0", $totalVoxels * 3);
+        $columnTop = [];
+        $columnBottom = [];
+        $secondPassChunkCount = $this->minecraftBirdsEyeRenderer->iterateRegionSections(
+            $regionFile,
+            function (int $chunkX, int $chunkZ, array $chunkSections) use (
+                &$occupancy,
+                &$colors,
+                &$columnTop,
+                &$columnBottom,
+                $minY,
+                $heightSpan,
+                $sourceWidth,
+                $sourceHeight
+            ): void {
+                foreach ($chunkSections as $sectionY => $section) {
+                    $uniformPaletteIndex = $section['uniform_palette_index'];
 
-        return [$columns, $minY, $maxY, $chunkCount];
+                    if ($uniformPaletteIndex !== null && ($section['palette_is_air'][$uniformPaletteIndex] ?? true) === true) {
+                        continue;
+                    }
+
+                    for ($localY = 0; $localY < 16; $localY++) {
+                        $worldY = ((int) $sectionY * 16) + $localY;
+                        $yOffset = $worldY - $minY;
+
+                        for ($localZ = 0; $localZ < 16; $localZ++) {
+                            $worldZ = ($chunkZ * 16) + $localZ;
+
+                            if ($worldZ < 0 || $worldZ >= $sourceHeight) {
+                                continue;
+                            }
+
+                            for ($localX = 0; $localX < 16; $localX++) {
+                                $worldX = ($chunkX * 16) + $localX;
+
+                                if ($worldX < 0 || $worldX >= $sourceWidth) {
+                                    continue;
+                                }
+
+                                if ($uniformPaletteIndex !== null) {
+                                    $paletteIndex = (int) $uniformPaletteIndex;
+                                } else {
+                                    $paletteIndex = $this->paletteIndexAt($section, $localX, $localZ, $localY);
+                                }
+
+                                if (($section['palette_is_air'][$paletteIndex] ?? true) === true) {
+                                    continue;
+                                }
+
+                                [$red, $green, $blue] = $section['palette_colors'][$paletteIndex] ?? [90, 90, 92];
+                                $columnIndex = ($worldZ * $sourceWidth) + $worldX;
+                                $voxelIndex = ($columnIndex * $heightSpan) + $yOffset;
+                                $this->setSolidVoxel($occupancy, $voxelIndex);
+                                $this->setPackedColorAt($colors, $voxelIndex, $red, $green, $blue);
+
+                                if (! isset($columnTop[$columnIndex]) || $worldY > $columnTop[$columnIndex]) {
+                                    $columnTop[$columnIndex] = $worldY;
+                                }
+
+                                if (! isset($columnBottom[$columnIndex]) || $worldY < $columnBottom[$columnIndex]) {
+                                    $columnBottom[$columnIndex] = $worldY;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        );
+        $columnRuns = $this->buildColumnRuns($occupancy, $heightSpan, $minY, $columnTop, $columnBottom);
+
+        return [
+            ['occupancy' => $occupancy, 'colors' => $colors],
+            $minY,
+            $maxY,
+            $heightSpan,
+            $columnRuns,
+            $secondPassChunkCount,
+        ];
     }
 
     /**
-     * @param  array<int, int>  $ys
+     * @param  array<int, int>  $columnTop
+     * @param  array<int, int>  $columnBottom
+     * @return array<int, array<int, int>>
      */
-    private function containsY(array $ys, int $target): bool
+    private function buildColumnRuns(string $occupancy, int $heightSpan, int $minY, array $columnTop, array $columnBottom): array
     {
-        $low = 0;
-        $high = count($ys) - 1;
+        $columnRuns = [];
 
-        while ($low <= $high) {
-            $mid = intdiv($low + $high, 2);
-            $value = $ys[$mid];
+        foreach ($columnTop as $columnIndex => $topY) {
+            $bottomY = $columnBottom[$columnIndex] ?? $topY;
+            $runs = [];
+            $inRun = false;
+            $runTop = $topY;
+            $runBottom = $topY;
 
-            if ($value === $target) {
-                return true;
+            for ($worldY = $topY; $worldY >= $bottomY; $worldY--) {
+                $yOffset = $worldY - $minY;
+                $voxelIndex = ($columnIndex * $heightSpan) + $yOffset;
+                $solid = $this->isSolidVoxel($occupancy, $voxelIndex);
+
+                if ($solid) {
+                    if (! $inRun) {
+                        $runTop = $worldY;
+                        $runBottom = $worldY;
+                        $inRun = true;
+                    } else {
+                        $runBottom = $worldY;
+                    }
+
+                    continue;
+                }
+
+                if ($inRun) {
+                    $runs[] = $runTop;
+                    $runs[] = $runBottom;
+                    $inRun = false;
+                }
             }
 
-            if ($value > $target) {
-                $low = $mid + 1;
-            } else {
-                $high = $mid - 1;
+            if ($inRun) {
+                $runs[] = $runTop;
+                $runs[] = $runBottom;
+            }
+
+            if ($runs !== []) {
+                $columnRuns[$columnIndex] = $runs;
             }
         }
 
-        return false;
+        return $columnRuns;
+    }
+
+    private function setSolidVoxel(string &$occupancy, int $voxelIndex): void
+    {
+        $byteIndex = intdiv($voxelIndex, 8);
+        $mask = 1 << ($voxelIndex & 7);
+        $byteValue = ord($occupancy[$byteIndex]);
+        $occupancy[$byteIndex] = chr($byteValue | $mask);
+    }
+
+    private function isSolidVoxel(string $occupancy, int $voxelIndex): bool
+    {
+        $byteIndex = intdiv($voxelIndex, 8);
+        $mask = 1 << ($voxelIndex & 7);
+        $byteValue = ord($occupancy[$byteIndex] ?? "\0");
+
+        return ($byteValue & $mask) !== 0;
+    }
+
+    private function setPackedColorAt(string &$colors, int $voxelIndex, int $red, int $green, int $blue): void
+    {
+        $offset = $voxelIndex * 3;
+        $colors[$offset] = chr($red & 0xFF);
+        $colors[$offset + 1] = chr($green & 0xFF);
+        $colors[$offset + 2] = chr($blue & 0xFF);
+    }
+
+    private function packedColorAt(string $colors, int $voxelIndex): int
+    {
+        $offset = $voxelIndex * 3;
+        $red = ord($colors[$offset] ?? "\0");
+        $green = ord($colors[$offset + 1] ?? "\0");
+        $blue = ord($colors[$offset + 2] ?? "\0");
+
+        return ($red << 16) | ($green << 8) | $blue;
     }
 
     private function depthOffsetForHeight(int $height): int
