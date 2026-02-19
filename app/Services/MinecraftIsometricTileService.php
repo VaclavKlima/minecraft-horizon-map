@@ -235,10 +235,12 @@ class MinecraftIsometricTileService
         $minRegionX = min(array_column($regions, 'region_x'));
         $minRegionZ = min(array_column($regions, 'region_z'));
         $placements = [];
+        $maxVerticalPadding = 0;
         $minX = null;
         $minY = null;
         $maxX = null;
         $maxY = null;
+        $baseIsoHeight = (int) ceil((512 + 512) / 2) + 8;
 
         foreach ($regions as $region) {
             $regionPath = $this->sourceMapPath($region['file']);
@@ -252,18 +254,27 @@ class MinecraftIsometricTileService
             $worldOffsetZ = ($region['region_z'] - $minRegionZ) * 512;
             $offsetX = $worldOffsetX - $worldOffsetZ;
             $offsetY = intdiv($worldOffsetX + $worldOffsetZ, 2);
+            $verticalPadding = max(0, $regionHeight - $baseIsoHeight);
             $placements[] = [
                 'file' => $region['file'],
-                'offset_x' => $offsetX,
-                'offset_y' => $offsetY,
+                'raw_offset_x' => $offsetX,
+                'raw_offset_y' => $offsetY,
                 'width' => $regionWidth,
                 'height' => $regionHeight,
+                'vertical_padding' => $verticalPadding,
             ];
+            $maxVerticalPadding = max($maxVerticalPadding, $verticalPadding);
+        }
 
-            $minX = $minX === null ? $offsetX : min($minX, $offsetX);
-            $minY = $minY === null ? $offsetY : min($minY, $offsetY);
-            $maxX = $maxX === null ? ($offsetX + $regionWidth) : max($maxX, $offsetX + $regionWidth);
-            $maxY = $maxY === null ? ($offsetY + $regionHeight) : max($maxY, $offsetY + $regionHeight);
+        foreach ($placements as $placementIndex => $placement) {
+            $normalizedOffsetY = $placement['raw_offset_y'] + ($maxVerticalPadding - $placement['vertical_padding']);
+            $placements[$placementIndex]['offset_x'] = $placement['raw_offset_x'];
+            $placements[$placementIndex]['offset_y'] = $normalizedOffsetY;
+
+            $minX = $minX === null ? $placement['raw_offset_x'] : min($minX, $placement['raw_offset_x']);
+            $minY = $minY === null ? $normalizedOffsetY : min($minY, $normalizedOffsetY);
+            $maxX = $maxX === null ? ($placement['raw_offset_x'] + $placement['width']) : max($maxX, $placement['raw_offset_x'] + $placement['width']);
+            $maxY = $maxY === null ? ($normalizedOffsetY + $placement['height']) : max($maxY, $normalizedOffsetY + $placement['height']);
         }
 
         if ($placements === [] || $minX === null || $minY === null || $maxX === null || $maxY === null) {
@@ -272,6 +283,23 @@ class MinecraftIsometricTileService
 
         $combinedWidth = $maxX - $minX;
         $combinedHeight = $maxY - $minY;
+
+        if ($combinedWidth <= 0 || $combinedHeight <= 0) {
+            throw new RuntimeException('Invalid combined isometric source image dimensions.');
+        }
+
+        $pixelCount = (float) $combinedWidth * (float) $combinedHeight;
+
+        if ($pixelCount > (float) PHP_INT_MAX) {
+            throw new RuntimeException(
+                sprintf(
+                    'Combined isometric image is too large to allocate (%dx%d).',
+                    $combinedWidth,
+                    $combinedHeight
+                )
+            );
+        }
+
         $combinedImage = imagecreatetruecolor($combinedWidth, $combinedHeight);
 
         if ($combinedImage === false) {
@@ -556,9 +584,75 @@ class MinecraftIsometricTileService
             ];
         }
 
+        $regions = $this->largestConnectedRegionGroup($regions);
         usort($regions, fn (array $left, array $right): int => $left['file'] <=> $right['file']);
 
         return $regions;
+    }
+
+    /**
+     * @param  array<int, array{file:string, region_x:int, region_z:int}>  $regions
+     * @return array<int, array{file:string, region_x:int, region_z:int}>
+     */
+    private function largestConnectedRegionGroup(array $regions): array
+    {
+        if ($regions === []) {
+            return [];
+        }
+
+        $indexByCoordinate = [];
+
+        foreach ($regions as $index => $region) {
+            $indexByCoordinate[$region['region_x'].':'.$region['region_z']] = $index;
+        }
+
+        $visited = [];
+        $largestComponent = [];
+
+        foreach ($regions as $startIndex => $region) {
+            if (isset($visited[$startIndex])) {
+                continue;
+            }
+
+            $queue = [$startIndex];
+            $visited[$startIndex] = true;
+            $component = [];
+
+            while ($queue !== []) {
+                $currentIndex = array_pop($queue);
+                $component[] = $regions[$currentIndex];
+                $current = $regions[$currentIndex];
+
+                for ($deltaX = -1; $deltaX <= 1; $deltaX++) {
+                    for ($deltaZ = -1; $deltaZ <= 1; $deltaZ++) {
+                        if ($deltaX === 0 && $deltaZ === 0) {
+                            continue;
+                        }
+
+                        $neighborKey = ($current['region_x'] + $deltaX).':'.($current['region_z'] + $deltaZ);
+
+                        if (! isset($indexByCoordinate[$neighborKey])) {
+                            continue;
+                        }
+
+                        $neighborIndex = $indexByCoordinate[$neighborKey];
+
+                        if (isset($visited[$neighborIndex])) {
+                            continue;
+                        }
+
+                        $visited[$neighborIndex] = true;
+                        $queue[] = $neighborIndex;
+                    }
+                }
+            }
+
+            if (count($component) > count($largestComponent)) {
+                $largestComponent = $component;
+            }
+        }
+
+        return $largestComponent !== [] ? $largestComponent : $regions;
     }
 
     /**

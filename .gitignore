@@ -24,3 +24,6 @@ Homestead.yaml
 Thumbs.db
 public/maps
 public/region
+
+# Rust native renderer build outputs
+native/**/target/
