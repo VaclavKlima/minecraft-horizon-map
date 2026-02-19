@@ -224,6 +224,58 @@ class MinecraftBirdsEyeRenderer
         ];
     }
 
+    /**
+     * Stream parsed section data chunk-by-chunk without building an in-memory region snapshot.
+     *
+     * @param  callable(int, int, array<int, array<string, mixed>>):void  $callback
+     */
+    public function iterateRegionSections(string $regionFile, callable $callback): int
+    {
+        $regionPath = public_path('region'.DIRECTORY_SEPARATOR.$regionFile);
+
+        if (! $this->files->exists($regionPath)) {
+            throw new RuntimeException("Region file not found: {$regionFile}");
+        }
+
+        $binary = $this->files->get($regionPath);
+
+        if (strlen($binary) < 8192) {
+            return 0;
+        }
+
+        $locationHeader = substr($binary, 0, 4096);
+        $count = 0;
+
+        for ($index = 0; $index < 1024; $index++) {
+            $locationEntry = substr($locationHeader, $index * 4, 4);
+            $offset = unpack('N', "\x00".substr($locationEntry, 0, 3))[1];
+            $sectorCount = ord($locationEntry[3]);
+
+            if ($offset === 0 || $sectorCount === 0) {
+                continue;
+            }
+
+            $chunkBinary = $this->readChunkPayload($binary, $offset);
+
+            if ($chunkBinary === null) {
+                continue;
+            }
+
+            $sections = $this->parseChunkSections($chunkBinary);
+
+            if ($sections === []) {
+                continue;
+            }
+
+            $chunkX = $index % 32;
+            $chunkZ = intdiv($index, 32);
+            $callback($chunkX, $chunkZ, $sections);
+            $count++;
+        }
+
+        return $count;
+    }
+
     public function regionNeedsRendering(string $regionFile, string $heightmapType = 'WORLD_SURFACE'): bool
     {
         $regionPath = public_path('region'.DIRECTORY_SEPARATOR.$regionFile);
