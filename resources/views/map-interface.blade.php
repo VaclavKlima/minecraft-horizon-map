@@ -52,6 +52,7 @@
 
             <main class="relative overflow-hidden">
                 <div id="map-viewport" class="absolute inset-0 cursor-grab overflow-hidden bg-slate-950 active:cursor-grabbing">
+                    <canvas id="isometric-canvas" class="absolute inset-0 hidden"></canvas>
                     <div id="tile-layer" class="absolute inset-0"></div>
                 </div>
 
@@ -62,6 +63,10 @@
                         <span>Cursor X:</span><span id="map-cursor-x">-</span>
                         <span>Cursor Z:</span><span id="map-cursor-z">-</span>
                         <span>Tiles:</span><span id="map-tiles">-</span>
+                        <span>Visible:</span><span id="map-visible-tiles">-</span>
+                        <span>Manifest ms:</span><span id="map-manifest-ms">-</span>
+                        <span>Render ms:</span><span id="map-render-ms">-</span>
+                        <span>Polls:</span><span id="map-poll-count">0</span>
                     </div>
                 </aside>
             </main>
@@ -70,11 +75,20 @@
         <script>
             const viewport = document.getElementById('map-viewport');
             const tileLayer = document.getElementById('tile-layer');
+            const isometricCanvas = document.getElementById('isometric-canvas');
+            const webglContext = isometricCanvas.getContext('webgl2', { alpha: true, antialias: false, premultipliedAlpha: true });
+            const isometricContext = webglContext === null
+                ? isometricCanvas.getContext('2d', { alpha: true, desynchronized: true })
+                : null;
             const statusEl = document.getElementById('map-status');
             const zoomEl = document.getElementById('map-zoom');
             const cursorXEl = document.getElementById('map-cursor-x');
             const cursorZEl = document.getElementById('map-cursor-z');
             const tilesEl = document.getElementById('map-tiles');
+            const visibleTilesEl = document.getElementById('map-visible-tiles');
+            const manifestMsEl = document.getElementById('map-manifest-ms');
+            const renderMsEl = document.getElementById('map-render-ms');
+            const pollCountEl = document.getElementById('map-poll-count');
             const renderButton = document.getElementById('render-map');
             const regionSelect = document.getElementById('region-select');
             const projectionSelect = document.getElementById('projection-select');
@@ -93,11 +107,30 @@
             let selectedProjection = 'birds-eye';
             let requestedViewState = null;
             let urlSyncTimeout = null;
-            let tileRetryTimer = null;
             let activeBatchId = null;
             let batchPollTimer = null;
+            let renderFrameRequested = false;
+            let cursorFrameRequested = false;
+            let lastPointerClientX = 0;
+            let lastPointerClientY = 0;
+            let renderedRegionOptionsKey = '';
+            let pollCount = 0;
+            let isometricCanvasWidth = 0;
+            let isometricCanvasHeight = 0;
+            let isometricCacheKey = '';
+            let webglProgram = null;
+            let webglBuffer = null;
+            let webglPositionAttribute = -1;
+            let webglTexCoordAttribute = -1;
+            let webglResolutionUniform = null;
+            let webglTextureUniform = null;
+
+            const isometricLayerCache = new Map();
 
             const tileSize = 256;
+            const preloadTileMargin = 1;
+            const maxIsometricOverzoomLevels = 2;
+            const usingWebglIsometric = webglContext !== null;
             const urlParams = new URLSearchParams(window.location.search);
 
             if (urlParams.get('projection') === 'isometric') {
@@ -128,6 +161,57 @@
 
             function levelInfo(level) {
                 return manifest.levels[String(level)];
+            }
+
+            function manifestZoomLevels() {
+                if (!manifest?.levels) {
+                    return [];
+                }
+
+                return Object.keys(manifest.levels)
+                    .map(value => Number.parseInt(value, 10))
+                    .filter(Number.isInteger)
+                    .sort((left, right) => left - right);
+            }
+
+            function availableZoomLevels() {
+                const levels = Array.isArray(manifest?.available_levels)
+                    ? manifest.available_levels
+                        .map(value => Number.parseInt(String(value), 10))
+                        .filter(Number.isInteger)
+                        .sort((left, right) => left - right)
+                    : [];
+
+                return levels;
+            }
+
+            function uiMaxZoom() {
+                const levels = manifestZoomLevels();
+
+                if (levels.length === 0) {
+                    return 0;
+                }
+
+                if (selectedProjection !== 'isometric') {
+                    return levels[levels.length - 1];
+                }
+
+                const nativeMaxZoom = Number.isInteger(manifest?.native_max_zoom)
+                    ? manifest.native_max_zoom
+                    : levels[levels.length - 1];
+                const absoluteMax = levels[levels.length - 1];
+
+                return Math.min(absoluteMax, nativeMaxZoom + maxIsometricOverzoomLevels);
+            }
+
+            function uiMinZoom() {
+                const levels = manifestZoomLevels();
+
+                if (levels.length === 0) {
+                    return 0;
+                }
+
+                return levels[0];
             }
 
             function updateUrlState() {
@@ -162,6 +246,16 @@
                 return 2 ** (nativeMaxZoom - level);
             }
 
+            function maxStaticZoomLevel() {
+                const levels = availableZoomLevels();
+
+                if (levels.length === 0) {
+                    return -1;
+                }
+
+                return levels[levels.length - 1];
+            }
+
             function clampOffsets() {
                 const info = levelInfo(zoom);
                 const maxOffsetX = Math.max(0, info.width - viewport.clientWidth);
@@ -187,11 +281,47 @@
                 return params.toString();
             }
 
+            function regionKeyForPath(regionFile) {
+                return String(regionFile ?? 'all').replaceAll('.', '_').replaceAll('/', '_');
+            }
+
+            function tileBasePath() {
+                const regionKey = regionKeyForPath(manifest?.selected_region ?? selectedRegion ?? 'all');
+
+                return `/maps/tiles/${regionKey}`;
+            }
+
             function tileUrl(level, x, y) {
-                const params = new URLSearchParams(buildQueryString(true));
+                const params = new URLSearchParams();
 
                 if (manifest?.generated_at) {
                     params.set('t', String(manifest.generated_at));
+                }
+
+                if (level <= maxStaticZoomLevel()) {
+                    return `${tileBasePath()}/${level}/${x}/${y}.png?${params.toString()}`;
+                }
+
+                params.set('projection', selectedProjection);
+
+                if (selectedRegion) {
+                    params.set('region', selectedRegion);
+                }
+
+                return `/api/maps/tiles/${level}/${x}/${y}.png?${params.toString()}`;
+            }
+
+            function apiTileUrl(level, x, y) {
+                const params = new URLSearchParams();
+
+                if (manifest?.generated_at) {
+                    params.set('t', String(manifest.generated_at));
+                }
+
+                params.set('projection', selectedProjection);
+
+                if (selectedRegion) {
+                    params.set('region', selectedRegion);
                 }
 
                 return `/api/maps/tiles/${level}/${x}/${y}.png?${params.toString()}`;
@@ -200,10 +330,266 @@
             function resetActiveTiles() {
                 activeTiles.forEach(tile => tile.remove());
                 activeTiles.clear();
+                clearIsometricCanvas();
+            }
+
+            function syncProjectionLayers() {
+                const isometricMode = selectedProjection === 'isometric';
+                isometricCanvas.classList.toggle('hidden', !isometricMode);
+                tileLayer.classList.toggle('hidden', isometricMode);
+            }
+
+            function initializeWebglRenderer() {
+                if (!usingWebglIsometric || webglContext === null || webglProgram !== null) {
+                    return;
+                }
+
+                const vertexSource = `
+                    attribute vec2 a_position;
+                    attribute vec2 a_texCoord;
+                    uniform vec2 u_resolution;
+                    varying vec2 v_texCoord;
+                    void main() {
+                        vec2 zeroToOne = a_position / u_resolution;
+                        vec2 zeroToTwo = zeroToOne * 2.0;
+                        vec2 clipSpace = zeroToTwo - 1.0;
+                        gl_Position = vec4(clipSpace * vec2(1.0, -1.0), 0.0, 1.0);
+                        v_texCoord = a_texCoord;
+                    }
+                `;
+                const fragmentSource = `
+                    precision mediump float;
+                    varying vec2 v_texCoord;
+                    uniform sampler2D u_texture;
+                    void main() {
+                        gl_FragColor = texture2D(u_texture, v_texCoord);
+                    }
+                `;
+
+                function compileShader(type, source) {
+                    const shader = webglContext.createShader(type);
+
+                    if (shader === null) {
+                        return null;
+                    }
+
+                    webglContext.shaderSource(shader, source);
+                    webglContext.compileShader(shader);
+
+                    if (!webglContext.getShaderParameter(shader, webglContext.COMPILE_STATUS)) {
+                        webglContext.deleteShader(shader);
+                        return null;
+                    }
+
+                    return shader;
+                }
+
+                const vertexShader = compileShader(webglContext.VERTEX_SHADER, vertexSource);
+                const fragmentShader = compileShader(webglContext.FRAGMENT_SHADER, fragmentSource);
+
+                if (vertexShader === null || fragmentShader === null) {
+                    return;
+                }
+
+                const program = webglContext.createProgram();
+
+                if (program === null) {
+                    return;
+                }
+
+                webglContext.attachShader(program, vertexShader);
+                webglContext.attachShader(program, fragmentShader);
+                webglContext.linkProgram(program);
+                webglContext.deleteShader(vertexShader);
+                webglContext.deleteShader(fragmentShader);
+
+                if (!webglContext.getProgramParameter(program, webglContext.LINK_STATUS)) {
+                    webglContext.deleteProgram(program);
+                    return;
+                }
+
+                const buffer = webglContext.createBuffer();
+
+                if (buffer === null) {
+                    webglContext.deleteProgram(program);
+                    return;
+                }
+
+                webglProgram = program;
+                webglBuffer = buffer;
+                webglPositionAttribute = webglContext.getAttribLocation(program, 'a_position');
+                webglTexCoordAttribute = webglContext.getAttribLocation(program, 'a_texCoord');
+                webglResolutionUniform = webglContext.getUniformLocation(program, 'u_resolution');
+                webglTextureUniform = webglContext.getUniformLocation(program, 'u_texture');
+
+                webglContext.enable(webglContext.BLEND);
+                webglContext.blendFunc(webglContext.SRC_ALPHA, webglContext.ONE_MINUS_SRC_ALPHA);
+            }
+
+            function clearIsometricCanvas() {
+                if (usingWebglIsometric && webglContext !== null) {
+                    webglContext.viewport(0, 0, isometricCanvas.width, isometricCanvas.height);
+                    webglContext.clearColor(0, 0, 0, 0);
+                    webglContext.clear(webglContext.COLOR_BUFFER_BIT);
+                    return;
+                }
+
+                if (isometricContext === null) {
+                    return;
+                }
+
+                if (isometricCanvasWidth <= 0 || isometricCanvasHeight <= 0) {
+                    return;
+                }
+
+                isometricContext.clearRect(0, 0, isometricCanvasWidth, isometricCanvasHeight);
+            }
+
+            function ensureIsometricCanvasSize() {
+                if (!usingWebglIsometric && isometricContext === null) {
+                    return;
+                }
+
+                const viewportWidth = Math.max(1, viewport.clientWidth);
+                const viewportHeight = Math.max(1, viewport.clientHeight);
+                const ratio = usingWebglIsometric ? 1 : Math.max(1, window.devicePixelRatio || 1);
+                const nextWidth = Math.max(1, Math.floor(viewportWidth * ratio));
+                const nextHeight = Math.max(1, Math.floor(viewportHeight * ratio));
+
+                if (isometricCanvas.width !== nextWidth || isometricCanvas.height !== nextHeight) {
+                    isometricCanvas.width = nextWidth;
+                    isometricCanvas.height = nextHeight;
+                }
+
+                isometricCanvas.style.width = `${viewportWidth}px`;
+                isometricCanvas.style.height = `${viewportHeight}px`;
+                isometricCanvasWidth = viewportWidth;
+                isometricCanvasHeight = viewportHeight;
+
+                if (!usingWebglIsometric && isometricContext !== null) {
+                    isometricContext.setTransform(ratio, 0, 0, ratio, 0, 0);
+                }
+            }
+
+            function createWebglTextureFromImage(image) {
+                if (!usingWebglIsometric || webglContext === null) {
+                    return null;
+                }
+
+                const texture = webglContext.createTexture();
+
+                if (texture === null) {
+                    return null;
+                }
+
+                webglContext.bindTexture(webglContext.TEXTURE_2D, texture);
+                webglContext.pixelStorei(webglContext.UNPACK_PREMULTIPLY_ALPHA_WEBGL, true);
+                webglContext.texParameteri(webglContext.TEXTURE_2D, webglContext.TEXTURE_WRAP_S, webglContext.CLAMP_TO_EDGE);
+                webglContext.texParameteri(webglContext.TEXTURE_2D, webglContext.TEXTURE_WRAP_T, webglContext.CLAMP_TO_EDGE);
+                webglContext.texParameteri(webglContext.TEXTURE_2D, webglContext.TEXTURE_MIN_FILTER, webglContext.NEAREST);
+                webglContext.texParameteri(webglContext.TEXTURE_2D, webglContext.TEXTURE_MAG_FILTER, webglContext.NEAREST);
+                webglContext.texImage2D(
+                    webglContext.TEXTURE_2D,
+                    0,
+                    webglContext.RGBA,
+                    webglContext.RGBA,
+                    webglContext.UNSIGNED_BYTE,
+                    image
+                );
+
+                return texture;
+            }
+
+            function syncIsometricLayerCache() {
+                const layers = Array.isArray(manifest?.image_layers) ? manifest.image_layers : [];
+                const nextKeys = new Set();
+
+                for (const layer of layers) {
+                    const key = `${layer.file}:${layer.url}`;
+                    nextKeys.add(key);
+
+                    if (isometricLayerCache.has(key)) {
+                        continue;
+                    }
+
+                    const image = new Image();
+                    image.decoding = 'async';
+                    image.loading = 'eager';
+                    image.fetchPriority = 'high';
+                    const entry = {
+                        image,
+                        loaded: false,
+                        failed: false,
+                        texture: null,
+                    };
+                    image.onload = () => {
+                        entry.loaded = true;
+                        if (usingWebglIsometric) {
+                            entry.texture = createWebglTextureFromImage(image);
+                        }
+                        requestRenderTiles();
+                    };
+                    image.onerror = () => {
+                        entry.failed = true;
+                    };
+                    image.src = layer.url;
+                    isometricLayerCache.set(key, entry);
+                }
+
+                for (const existingKey of isometricLayerCache.keys()) {
+                    if (!nextKeys.has(existingKey)) {
+                        const staleEntry = isometricLayerCache.get(existingKey);
+                        if (usingWebglIsometric && webglContext !== null && staleEntry?.texture) {
+                            webglContext.deleteTexture(staleEntry.texture);
+                        }
+                        isometricLayerCache.delete(existingKey);
+                    }
+                }
+            }
+
+            function requestRenderTiles() {
+                if (renderFrameRequested) {
+                    return;
+                }
+
+                renderFrameRequested = true;
+                window.requestAnimationFrame(() => {
+                    renderFrameRequested = false;
+                    renderTiles();
+                });
+            }
+
+            function scheduleCursorReadout(clientX, clientY) {
+                lastPointerClientX = clientX;
+                lastPointerClientY = clientY;
+
+                if (cursorFrameRequested) {
+                    return;
+                }
+
+                cursorFrameRequested = true;
+                window.requestAnimationFrame(() => {
+                    cursorFrameRequested = false;
+
+                    if (!manifest) {
+                        return;
+                    }
+
+                    const rect = viewport.getBoundingClientRect();
+                    const pointerX = lastPointerClientX - rect.left;
+                    const pointerY = lastPointerClientY - rect.top;
+                    const divisor = mapDivisor(zoom);
+                    const worldX = Math.floor((manifest.world_min_x ?? 0) + ((offsetX + pointerX) * divisor));
+                    const worldZ = Math.floor((manifest.world_min_z ?? 0) + ((offsetY + pointerY) * divisor));
+                    cursorXEl.textContent = String(worldX);
+                    cursorZEl.textContent = String(worldZ);
+                });
             }
 
             function stopBatchPolling() {
                 activeBatchId = null;
+                pollCount = 0;
+                pollCountEl.textContent = '0';
 
                 if (batchPollTimer !== null) {
                     window.clearTimeout(batchPollTimer);
@@ -216,37 +602,201 @@
                     return;
                 }
 
+                const renderStartedAt = performance.now();
                 const info = levelInfo(zoom);
+                if (!info) {
+                    return;
+                }
+
                 clampOffsets();
 
-                const minTileX = Math.floor(offsetX / tileSize);
-                const minTileY = Math.floor(offsetY / tileSize);
-                const maxTileX = Math.min(info.tiles_x - 1, Math.floor((offsetX + viewport.clientWidth) / tileSize));
-                const maxTileY = Math.min(info.tiles_y - 1, Math.floor((offsetY + viewport.clientHeight) / tileSize));
+                if (selectedProjection === 'isometric') {
+                    ensureIsometricCanvasSize();
+
+                    const layers = Array.isArray(manifest?.image_layers) ? manifest.image_layers : [];
+                    const divisor = mapDivisor(zoom);
+                    let drawnLayerCount = 0;
+                    let visibleLayerCount = 0;
+
+                    if (usingWebglIsometric && webglContext !== null) {
+                        initializeWebglRenderer();
+
+                        if (
+                            webglProgram === null
+                            || webglBuffer === null
+                            || webglResolutionUniform === null
+                            || webglTextureUniform === null
+                            || webglPositionAttribute < 0
+                            || webglTexCoordAttribute < 0
+                        ) {
+                            return;
+                        }
+
+                        webglContext.viewport(0, 0, isometricCanvas.width, isometricCanvas.height);
+                        webglContext.clearColor(0, 0, 0, 0);
+                        webglContext.clear(webglContext.COLOR_BUFFER_BIT);
+                        webglContext.useProgram(webglProgram);
+                        webglContext.bindBuffer(webglContext.ARRAY_BUFFER, webglBuffer);
+                        webglContext.enableVertexAttribArray(webglPositionAttribute);
+                        webglContext.enableVertexAttribArray(webglTexCoordAttribute);
+                        webglContext.vertexAttribPointer(webglPositionAttribute, 2, webglContext.FLOAT, false, 16, 0);
+                        webglContext.vertexAttribPointer(webglTexCoordAttribute, 2, webglContext.FLOAT, false, 16, 8);
+                        webglContext.uniform2f(webglResolutionUniform, isometricCanvasWidth, isometricCanvasHeight);
+                        webglContext.uniform1i(webglTextureUniform, 0);
+                    } else if (isometricContext !== null) {
+                        isometricContext.clearRect(0, 0, isometricCanvasWidth, isometricCanvasHeight);
+                        isometricContext.imageSmoothingEnabled = false;
+                    } else {
+                        return;
+                    }
+
+                    for (const layer of layers) {
+                        const cacheKey = `${layer.file}:${layer.url}`;
+                        const cacheEntry = isometricLayerCache.get(cacheKey);
+                        const layerX = Math.floor((layer.offset_x ?? 0) / divisor);
+                        const layerY = Math.floor((layer.offset_y ?? 0) / divisor);
+                        const layerWidth = Math.max(1, Math.ceil((layer.width ?? 0) / divisor));
+                        const layerHeight = Math.max(1, Math.ceil((layer.height ?? 0) / divisor));
+                        const drawX = layerX - offsetX;
+                        const drawY = layerY - offsetY;
+
+                        const layerRight = drawX + layerWidth;
+                        const layerBottom = drawY + layerHeight;
+                        const intersectsViewport = layerRight >= 0
+                            && layerBottom >= 0
+                            && drawX <= viewport.clientWidth
+                            && drawY <= viewport.clientHeight;
+
+                        if (intersectsViewport) {
+                            visibleLayerCount++;
+                        }
+
+                        if (!intersectsViewport || !cacheEntry || cacheEntry.failed || !cacheEntry.loaded) {
+                            continue;
+                        }
+
+                        const clipX = Math.max(0, drawX);
+                        const clipY = Math.max(0, drawY);
+                        const clipX2 = Math.min(viewport.clientWidth, drawX + layerWidth);
+                        const clipY2 = Math.min(viewport.clientHeight, drawY + layerHeight);
+                        const clipWidth = clipX2 - clipX;
+                        const clipHeight = clipY2 - clipY;
+
+                        if (clipWidth <= 0 || clipHeight <= 0) {
+                            continue;
+                        }
+
+                        const normalizedClipX = (clipX - drawX) / layerWidth;
+                        const normalizedClipY = (clipY - drawY) / layerHeight;
+                        const normalizedClipX2 = (clipX + clipWidth - drawX) / layerWidth;
+                        const normalizedClipY2 = (clipY + clipHeight - drawY) / layerHeight;
+
+                        if (usingWebglIsometric && webglContext !== null) {
+                            if (!cacheEntry.texture) {
+                                cacheEntry.texture = createWebglTextureFromImage(cacheEntry.image);
+                            }
+
+                            if (!cacheEntry.texture) {
+                                continue;
+                            }
+
+                            const x1 = clipX;
+                            const y1 = clipY;
+                            const x2 = clipX + clipWidth;
+                            const y2 = clipY + clipHeight;
+                            const tx1 = normalizedClipX;
+                            const ty1 = normalizedClipY;
+                            const tx2 = normalizedClipX2;
+                            const ty2 = normalizedClipY2;
+                            const vertices = new Float32Array([
+                                x1, y1, tx1, ty1,
+                                x2, y1, tx2, ty1,
+                                x1, y2, tx1, ty2,
+                                x1, y2, tx1, ty2,
+                                x2, y1, tx2, ty1,
+                                x2, y2, tx2, ty2,
+                            ]);
+
+                            webglContext.activeTexture(webglContext.TEXTURE0);
+                            webglContext.bindTexture(webglContext.TEXTURE_2D, cacheEntry.texture);
+                            webglContext.bufferData(webglContext.ARRAY_BUFFER, vertices, webglContext.STREAM_DRAW);
+                            webglContext.drawArrays(webglContext.TRIANGLES, 0, 6);
+                        } else if (isometricContext !== null) {
+                            const sourceX = Math.floor(normalizedClipX * cacheEntry.image.naturalWidth);
+                            const sourceY = Math.floor(normalizedClipY * cacheEntry.image.naturalHeight);
+                            const sourceWidth = Math.max(1, Math.ceil((normalizedClipX2 - normalizedClipX) * cacheEntry.image.naturalWidth));
+                            const sourceHeight = Math.max(1, Math.ceil((normalizedClipY2 - normalizedClipY) * cacheEntry.image.naturalHeight));
+
+                            isometricContext.drawImage(
+                                cacheEntry.image,
+                                sourceX,
+                                sourceY,
+                                sourceWidth,
+                                sourceHeight,
+                                clipX,
+                                clipY,
+                                clipWidth,
+                                clipHeight
+                            );
+                        }
+
+                        drawnLayerCount++;
+                    }
+
+                    zoomEl.textContent = `${zoom} / ${uiMaxZoom()}`;
+                    tilesEl.textContent = `${info.width} x ${info.height}`;
+                    visibleTilesEl.textContent = `${drawnLayerCount}/${visibleLayerCount} layers`;
+                    renderMsEl.textContent = `${Math.round(performance.now() - renderStartedAt)}`;
+                    scheduleUrlStateSync();
+                    return;
+                }
+
+                const staticMaxZoom = maxStaticZoomLevel();
+                const renderZoom = staticMaxZoom >= 0 ? Math.min(zoom, staticMaxZoom) : zoom;
+                const renderInfo = levelInfo(renderZoom);
+
+                if (!renderInfo) {
+                    return;
+                }
+
+                const scale = 2 ** (zoom - renderZoom);
+                const scaledTileSize = tileSize * scale;
+                const sourceOffsetX = offsetX / scale;
+                const sourceOffsetY = offsetY / scale;
+                const visibleMinTileX = Math.floor(sourceOffsetX / tileSize);
+                const visibleMinTileY = Math.floor(sourceOffsetY / tileSize);
+                const visibleMaxTileX = Math.min(renderInfo.tiles_x - 1, Math.floor((sourceOffsetX + (viewport.clientWidth / scale)) / tileSize));
+                const visibleMaxTileY = Math.min(renderInfo.tiles_y - 1, Math.floor((sourceOffsetY + (viewport.clientHeight / scale)) / tileSize));
+                const minTileX = Math.max(0, visibleMinTileX - preloadTileMargin);
+                const minTileY = Math.max(0, visibleMinTileY - preloadTileMargin);
+                const maxTileX = Math.min(renderInfo.tiles_x - 1, visibleMaxTileX + preloadTileMargin);
+                const maxTileY = Math.min(renderInfo.tiles_y - 1, visibleMaxTileY + preloadTileMargin);
                 const nextKeys = new Set();
+                let visibleTileCount = 0;
 
                 for (let tileY = minTileY; tileY <= maxTileY; tileY++) {
                     for (let tileX = minTileX; tileX <= maxTileX; tileX++) {
-                        const key = `${zoom}:${tileX}:${tileY}`;
+                        const key = `${zoom}:${renderZoom}:${tileX}:${tileY}`;
+                        const isVisible = tileX >= visibleMinTileX
+                            && tileX <= visibleMaxTileX
+                            && tileY >= visibleMinTileY
+                            && tileY <= visibleMaxTileY;
                         nextKeys.add(key);
 
                         if (!activeTiles.has(key)) {
                             const img = new Image();
                             img.draggable = false;
-                            img.src = tileUrl(zoom, tileX, tileY);
+                            img.src = tileUrl(renderZoom, tileX, tileY);
+                            img.decoding = 'async';
+                            img.loading = isVisible ? 'eager' : 'lazy';
+                            img.fetchPriority = isVisible ? 'high' : 'low';
                             img.onerror = () => {
-                                if (selectedProjection !== 'isometric') {
+                                if (!img.dataset.apiFallback) {
+                                    img.dataset.apiFallback = '1';
+                                    img.src = apiTileUrl(renderZoom, tileX, tileY);
+
                                     return;
                                 }
-
-                                if (tileRetryTimer !== null) {
-                                    return;
-                                }
-
-                                tileRetryTimer = window.setTimeout(() => {
-                                    tileRetryTimer = null;
-                                    renderTiles();
-                                }, 650);
                             };
                             img.className = 'absolute h-64 w-64 select-none';
                             activeTiles.set(key, img);
@@ -254,8 +804,16 @@
                         }
 
                         const tile = activeTiles.get(key);
-                        tile.style.left = `${tileX * tileSize - offsetX}px`;
-                        tile.style.top = `${tileY * tileSize - offsetY}px`;
+                        tile.loading = isVisible ? 'eager' : 'lazy';
+                        tile.fetchPriority = isVisible ? 'high' : 'low';
+                        tile.style.left = `${(tileX * scaledTileSize) - offsetX}px`;
+                        tile.style.top = `${(tileY * scaledTileSize) - offsetY}px`;
+                        tile.style.width = `${scaledTileSize}px`;
+                        tile.style.height = `${scaledTileSize}px`;
+
+                        if (isVisible) {
+                            visibleTileCount++;
+                        }
                     }
                 }
 
@@ -266,30 +824,44 @@
                     }
                 }
 
-                zoomEl.textContent = `${zoom} / ${manifest.max_zoom}`;
+                zoomEl.textContent = `${zoom} / ${uiMaxZoom()} (src: ${renderZoom})`;
                 tilesEl.textContent = `${info.tiles_x} x ${info.tiles_y}`;
+                visibleTilesEl.textContent = String(visibleTileCount);
+                renderMsEl.textContent = `${Math.round(performance.now() - renderStartedAt)}`;
                 scheduleUrlStateSync();
             }
 
             function renderRegionOptions() {
                 const regions = manifest?.available_regions ?? [];
+                const optionsKey = regions.join('|');
+
+                if (optionsKey === renderedRegionOptionsKey) {
+                    regionSelect.value = selectedRegion ?? 'all';
+                    regionSelect.disabled = regions.length === 0;
+
+                    return;
+                }
+
+                renderedRegionOptionsKey = optionsKey;
                 regionSelect.innerHTML = '';
+                const fragment = document.createDocumentFragment();
 
                 for (const region of regions) {
                     const option = document.createElement('option');
                     option.value = region;
                     option.textContent = region === 'all' ? 'All regions' : region;
                     option.selected = region === selectedRegion;
-                    regionSelect.appendChild(option);
+                    fragment.appendChild(option);
                 }
 
+                regionSelect.appendChild(fragment);
                 regionSelect.disabled = regions.length === 0;
             }
 
             function fitInitialPosition() {
                 const viewportWidth = viewport.clientWidth;
                 const viewportHeight = viewport.clientHeight;
-                if (requestedViewState && requestedViewState.zoom >= 0 && requestedViewState.zoom <= manifest.max_zoom) {
+                if (requestedViewState && requestedViewState.zoom >= uiMinZoom() && requestedViewState.zoom <= uiMaxZoom()) {
                     zoom = requestedViewState.zoom;
                     offsetX = requestedViewState.x;
                     offsetY = requestedViewState.y;
@@ -298,8 +870,8 @@
                     return;
                 }
 
-                let candidate = manifest.max_zoom;
-                while (candidate > 0) {
+                let candidate = uiMaxZoom();
+                while (candidate > uiMinZoom()) {
                     const info = levelInfo(candidate);
                     if (info.width <= viewportWidth * 1.4 && info.height <= viewportHeight * 1.4) {
                         break;
@@ -314,7 +886,7 @@
             }
 
             function zoomAtPointer(direction, clientX, clientY) {
-                const nextZoom = Math.max(0, Math.min(manifest.max_zoom, zoom + direction));
+                const nextZoom = Math.max(uiMinZoom(), Math.min(uiMaxZoom(), zoom + direction));
 
                 if (nextZoom === zoom) {
                     return;
@@ -332,47 +904,65 @@
                 offsetX = Math.floor(worldX / targetDivisor - pointerX);
                 offsetY = Math.floor(worldY / targetDivisor - pointerY);
                 resetActiveTiles();
-                renderTiles();
+                requestRenderTiles();
             }
 
-            async function loadManifest(region = selectedRegion, preserveView = false) {
+            async function loadManifest(region = selectedRegion, options = {}) {
+                const manifestStartedAt = performance.now();
+                const preserveView = options.preserveView === true;
+                const includeRegions = options.includeRegions !== false;
+                const refresh = options.refresh !== false;
                 setStatus('Loading map manifest...');
                 selectedRegion = region || null;
                 const hadManifest = manifest !== null;
                 const query = buildQueryString(true);
-                const response = await fetch(`/api/maps/manifest?${query}`);
+                const response = await fetch(`/api/maps/manifest?${query}&include_regions=${includeRegions ? '1' : '0'}&refresh=${refresh ? '1' : '0'}`);
                 const payload = await response.json();
 
                 if (!payload.available) {
                     manifest = null;
                     selectedRegion = null;
-                    regionSelect.innerHTML = '<option value="">No regions</option>';
-                    regionSelect.disabled = true;
+                    if (includeRegions) {
+                        regionSelect.innerHTML = '<option value="">No regions</option>';
+                        regionSelect.disabled = true;
+                        renderedRegionOptionsKey = '';
+                    }
                     resetActiveTiles();
                     setStatus(payload.message ?? 'Map not available.');
+                    manifestMsEl.textContent = `${Math.round(performance.now() - manifestStartedAt)}`;
                     scheduleUrlStateSync();
                     return;
                 }
 
                 manifest = payload.manifest;
                 selectedRegion = manifest.selected_region;
-                renderRegionOptions();
+                syncProjectionLayers();
+                const nextCacheKey = `${selectedProjection}:${selectedRegion}:${manifest.generated_at ?? ''}`;
+                if (selectedProjection === 'isometric' && isometricCacheKey !== nextCacheKey) {
+                    isometricCacheKey = nextCacheKey;
+                    syncIsometricLayerCache();
+                }
+                if (includeRegions) {
+                    renderRegionOptions();
+                }
                 if (preserveView && hadManifest) {
-                    zoom = Math.min(zoom, manifest.max_zoom);
+                    zoom = Math.min(zoom, uiMaxZoom());
                     clampOffsets();
                 } else {
                     fitInitialPosition();
                 }
 
                 resetActiveTiles();
-                renderTiles();
+                requestRenderTiles();
                 setStatus(`Map loaded (${selectedProjection}, ${selectedRegion}): ${manifest.source_width} x ${manifest.source_height} blocks`);
+                manifestMsEl.textContent = `${Math.round(performance.now() - manifestStartedAt)}`;
                 scheduleUrlStateSync();
             }
 
             async function pollBatchUntilFinished(batchId) {
                 stopBatchPolling();
                 activeBatchId = batchId;
+                let pollIteration = 0;
 
                 const poll = async () => {
                     if (activeBatchId !== batchId) {
@@ -387,7 +977,19 @@
                         }
 
                         const payload = await response.json();
-                        await loadManifest(selectedRegion, true);
+                        pollIteration++;
+                        pollCount++;
+                        pollCountEl.textContent = String(pollCount);
+                        const shouldRefreshManifest = selectedProjection === 'isometric' && selectedRegion === 'all'
+                            ? pollIteration % 2 === 0
+                            : pollIteration % 4 === 0;
+                        if (payload.finished === true || shouldRefreshManifest) {
+                            await loadManifest(selectedRegion, {
+                                preserveView: true,
+                                includeRegions: false,
+                                refresh: shouldRefreshManifest || payload.finished === true,
+                            });
+                        }
                         const processedJobs = payload.processed_jobs ?? 0;
                         const totalJobs = payload.total_jobs ?? 0;
                         const failedJobs = payload.failed_jobs ?? 0;
@@ -439,7 +1041,11 @@
 
                     if (queuedRegions === 0 || batchId === '') {
                         setStatus(payload.message ?? 'No changed regions detected.');
-                        await loadManifest(selectedRegion, true);
+                        await loadManifest(selectedRegion, {
+                            preserveView: true,
+                            includeRegions: false,
+                            refresh: true,
+                        });
 
                         return;
                     }
@@ -466,16 +1072,7 @@
             });
 
             window.addEventListener('mousemove', event => {
-                if (manifest) {
-                    const rect = viewport.getBoundingClientRect();
-                    const pointerX = event.clientX - rect.left;
-                    const pointerY = event.clientY - rect.top;
-                    const divisor = mapDivisor(zoom);
-                    const worldX = Math.floor((manifest.world_min_x ?? 0) + ((offsetX + pointerX) * divisor));
-                    const worldZ = Math.floor((manifest.world_min_z ?? 0) + ((offsetY + pointerY) * divisor));
-                    cursorXEl.textContent = String(worldX);
-                    cursorZEl.textContent = String(worldZ);
-                }
+                scheduleCursorReadout(event.clientX, event.clientY);
 
                 if (!isDragging || !manifest) {
                     return;
@@ -483,7 +1080,7 @@
 
                 offsetX = dragOriginX - (event.clientX - dragStartX);
                 offsetY = dragOriginY - (event.clientY - dragStartY);
-                renderTiles();
+                requestRenderTiles();
             });
 
             viewport.addEventListener('wheel', event => {
@@ -497,7 +1094,10 @@
 
             window.addEventListener('resize', () => {
                 if (manifest) {
-                    renderTiles();
+                    if (selectedProjection === 'isometric') {
+                        ensureIsometricCanvasSize();
+                    }
+                    requestRenderTiles();
                 }
             });
 
@@ -506,7 +1106,11 @@
                 selectedRegion = regionSelect.value || null;
                 resetActiveTiles();
                 scheduleUrlStateSync();
-                loadManifest(selectedRegion).catch(error => setStatus(error.message));
+                loadManifest(selectedRegion, {
+                    preserveView: false,
+                    includeRegions: true,
+                    refresh: true,
+                }).catch(error => setStatus(error.message));
             });
 
             projectionSelect.addEventListener('change', () => {
@@ -514,11 +1118,21 @@
                 selectedProjection = projectionSelect.value || 'birds-eye';
                 selectedRegion = null;
                 resetActiveTiles();
+                syncProjectionLayers();
                 scheduleUrlStateSync();
-                loadManifest(null).catch(error => setStatus(error.message));
+                loadManifest(null, {
+                    preserveView: false,
+                    includeRegions: true,
+                    refresh: true,
+                }).catch(error => setStatus(error.message));
             });
 
-            loadManifest().catch(error => setStatus(error.message));
+            loadManifest(null, {
+                preserveView: false,
+                includeRegions: true,
+                refresh: true,
+            }).catch(error => setStatus(error.message));
+            syncProjectionLayers();
         </script>
     </body>
 </html>

@@ -41,6 +41,7 @@ class IsometricNativeRenderer
         $outputRelativePath = 'maps/isometric/regions/'.str_replace('.mca', '.png', $regionFile);
         $outputPath = public_path($outputRelativePath);
         $this->files->ensureDirectoryExists(dirname($outputPath));
+        $pixelScale = max(1, (int) config('render.isometric_native_pixel_scale', 1));
 
         $tempDir = storage_path('app'.DIRECTORY_SEPARATOR.'isometric-native'.DIRECTORY_SEPARATOR.uniqid('run_', true));
         $this->files->ensureDirectoryExists($tempDir);
@@ -64,6 +65,8 @@ class IsometricNativeRenderer
                 (string) $sourceWidth,
                 '--source-height',
                 (string) $sourceHeight,
+                '--pixel-scale',
+                (string) $pixelScale,
                 '--sections-path',
                 $sectionsPath,
             ]);
@@ -72,13 +75,31 @@ class IsometricNativeRenderer
 
             if (! $process->isSuccessful()) {
                 if ($process->getExitCode() === 3) {
-                    return null;
+                    Log::info('Native isometric renderer reported empty region; generating transparent placeholder.', [
+                        'region_file' => $regionFile,
+                    ]);
+
+                    [$isoWidth, $isoHeight] = $this->createTransparentPlaceholderRegionImage(
+                        $outputPath,
+                        $sourceWidth,
+                        $sourceHeight,
+                        $pixelScale
+                    );
+
+                    return [
+                        'region_file' => $regionFile,
+                        'file' => basename($outputPath),
+                        'relative_path' => $outputRelativePath,
+                        'width_blocks' => $isoWidth,
+                        'height_blocks' => $isoHeight,
+                    ];
                 }
 
                 Log::warning('Native isometric renderer failed.', [
                     'region_file' => $regionFile,
                     'exit_code' => $process->getExitCode(),
                     'stderr' => trim($process->getErrorOutput()),
+                    'stdout' => trim($process->getOutput()),
                 ]);
 
                 return null;
@@ -90,8 +111,8 @@ class IsometricNativeRenderer
 
             /** @var array{iso_width:int,iso_height:int}|null $metrics */
             $metrics = $this->decodeMetrics($process->getOutput());
-            $isoWidth = $metrics['iso_width'] ?? ($sourceWidth + $sourceHeight);
-            $isoHeight = $metrics['iso_height'] ?? (int) ceil(($sourceWidth + $sourceHeight) / 2);
+            $isoWidth = $metrics['iso_width'] ?? (($sourceWidth + $sourceHeight + 2) * $pixelScale);
+            $isoHeight = $metrics['iso_height'] ?? ((int) ceil(($sourceWidth + $sourceHeight) / 2) * $pixelScale);
         } catch (\Throwable $exception) {
             Log::warning('Native isometric renderer threw an exception.', [
                 'region_file' => $regionFile,
@@ -131,5 +152,33 @@ class IsometricNativeRenderer
             'iso_width' => (int) $decoded['iso_width'],
             'iso_height' => (int) $decoded['iso_height'],
         ];
+    }
+
+    /**
+     * @return array{0:int,1:int}
+     */
+    private function createTransparentPlaceholderRegionImage(
+        string $outputPath,
+        int $sourceWidth,
+        int $sourceHeight,
+        int $pixelScale
+    ): array {
+        $safeScale = max(1, $pixelScale);
+        $isoWidth = ($sourceWidth + $sourceHeight + 2) * $safeScale;
+        $isoHeight = ((int) ceil(($sourceWidth + $sourceHeight) / 2) + 8) * $safeScale;
+        $placeholder = imagecreatetruecolor($isoWidth, $isoHeight);
+
+        if ($placeholder === false) {
+            throw new RuntimeException('Unable to allocate transparent placeholder image.');
+        }
+
+        imagealphablending($placeholder, false);
+        imagesavealpha($placeholder, true);
+        $transparent = imagecolorallocatealpha($placeholder, 0, 0, 0, 127);
+        imagefill($placeholder, 0, 0, $transparent);
+        imagepng($placeholder, $outputPath);
+        imagedestroy($placeholder);
+
+        return [$isoWidth, $isoHeight];
     }
 }

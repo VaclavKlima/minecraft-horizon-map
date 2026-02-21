@@ -24,6 +24,8 @@ class ReadMapRegionRequest extends FormRequest
         return [
             'region' => ['nullable', 'string', 'regex:/^(all|r\.-?\d+\.-?\d+\.mca)$/'],
             'projection' => ['nullable', 'string', 'in:birds-eye,isometric'],
+            'include_regions' => ['nullable', 'boolean'],
+            'refresh' => ['nullable', 'boolean'],
         ];
     }
 

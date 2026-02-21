@@ -20,48 +20,87 @@ class MinecraftMapTileService
     /**
      * @return array<string, mixed>|null
      */
-    public function getManifest(?string $regionFile = null): ?array
+    public function getManifest(?string $regionFile = null, bool $includeRegions = true, bool $refresh = true): ?array
     {
         if (! extension_loaded('gd')) {
             throw new RuntimeException('The GD extension is required to generate map tiles.');
         }
 
-        $availableRegions = $this->availableRegionsWithCoordinates();
+        $availableRegions = [];
+        $selectedRegion = $regionFile ?? self::ALL_REGIONS;
 
-        if ($availableRegions === []) {
-            return null;
-        }
+        if ($includeRegions) {
+            $availableRegions = $this->availableRegionsWithCoordinates();
 
-        $selectedRegion = $this->normalizeRegionSelection($regionFile, $availableRegions);
-
-        if ($selectedRegion === null) {
-            return null;
-        }
-
-        if ($selectedRegion === self::ALL_REGIONS) {
-            $this->ensureCombinedManifestIsFresh($availableRegions);
-        } else {
-            $sourcePath = $this->sourceMapPath($selectedRegion);
-
-            if (! $this->files->exists($sourcePath)) {
+            if ($availableRegions === []) {
                 return null;
             }
 
-            $this->ensureManifestIsFresh($selectedRegion);
+            $selectedRegion = $this->normalizeRegionSelection($regionFile, $availableRegions);
+
+            if ($selectedRegion === null) {
+                return null;
+            }
+
+            if ($selectedRegion === self::ALL_REGIONS) {
+                if ($refresh) {
+                    $this->ensureCombinedManifestIsFresh($availableRegions);
+                }
+            } else {
+                $sourcePath = $this->sourceMapPath($selectedRegion);
+
+                if (! $this->files->exists($sourcePath)) {
+                    return null;
+                }
+
+                if ($refresh) {
+                    $this->ensureManifestIsFresh($selectedRegion);
+                }
+            }
+        } else {
+            if ($selectedRegion === self::ALL_REGIONS) {
+                if ($refresh) {
+                    $regionsForRefresh = $this->availableRegionsWithCoordinates();
+
+                    if ($regionsForRefresh === []) {
+                        return null;
+                    }
+
+                    $this->ensureCombinedManifestIsFresh($regionsForRefresh);
+                }
+            } else {
+                $sourcePath = $this->sourceMapPath($selectedRegion);
+
+                if (! $this->files->exists($sourcePath)) {
+                    return null;
+                }
+
+                if ($refresh) {
+                    $this->ensureManifestIsFresh($selectedRegion);
+                }
+            }
+        }
+
+        if (! $this->files->exists($this->manifestPath($selectedRegion))) {
+            return null;
         }
 
         /** @var array<string, mixed> $manifest */
         $manifest = json_decode($this->files->get($this->manifestPath($selectedRegion)), true, flags: JSON_THROW_ON_ERROR);
 
         $manifest['selected_region'] = $selectedRegion;
-        $manifest['available_regions'] = array_values(array_unique(array_merge([self::ALL_REGIONS], array_column($availableRegions, 'file'))));
+        $manifest['available_levels'] = $this->availableTileLevels($selectedRegion, $manifest);
+
+        if ($includeRegions) {
+            $manifest['available_regions'] = array_values(array_unique(array_merge([self::ALL_REGIONS], array_column($availableRegions, 'file'))));
+        }
 
         return $manifest;
     }
 
     public function getTilePath(int $zoom, int $tileX, int $tileY, ?string $regionFile = null): ?string
     {
-        $manifest = $this->getManifest($regionFile);
+        $manifest = $this->getManifest($regionFile, false, false);
 
         if ($manifest === null) {
             return null;
@@ -531,6 +570,32 @@ class MinecraftMapTileService
             .DIRECTORY_SEPARATOR.$zoom
             .DIRECTORY_SEPARATOR.$tileX
             .DIRECTORY_SEPARATOR.$tileY.'.png';
+    }
+
+    /**
+     * @param  array<string, mixed>  $manifest
+     * @return array<int, int>
+     */
+    private function availableTileLevels(string $regionFile, array $manifest): array
+    {
+        $levels = [];
+
+        foreach ($manifest['levels'] as $zoom => $level) {
+            $zoomLevel = (int) $zoom;
+            $levelPath = $this->tilesRootPath($regionFile).DIRECTORY_SEPARATOR.$zoomLevel;
+
+            if ($this->files->isDirectory($levelPath)) {
+                $levels[] = $zoomLevel;
+            }
+        }
+
+        if ($levels !== []) {
+            sort($levels);
+
+            return $levels;
+        }
+
+        return [];
     }
 
     private function safeEnsureDirectoryExists(string $path): void

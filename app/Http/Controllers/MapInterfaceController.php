@@ -26,11 +26,21 @@ class MapInterfaceController extends Controller
     {
         $region = $request->string('region')->toString();
         $projection = $request->string('projection', 'birds-eye')->toString();
+        $includeRegions = $request->boolean('include_regions', true);
+        $refresh = $request->boolean('refresh', true);
 
         try {
             $manifest = $projection === 'isometric'
-                ? $this->minecraftIsometricTileService->getManifest($region !== '' ? $region : null, true)
-                : $this->minecraftMapTileService->getManifest($region !== '' ? $region : null);
+                ? $this->minecraftIsometricTileService->getManifest(
+                    $region !== '' ? $region : null,
+                    $refresh,
+                    $includeRegions
+                )
+                : $this->minecraftMapTileService->getManifest(
+                    $region !== '' ? $region : null,
+                    $includeRegions,
+                    $refresh
+                );
         } catch (RuntimeException $exception) {
             return response()->json([
                 'available' => false,

@@ -1,6 +1,5 @@
 <?php
 
-use App\Jobs\GenerateRegionIsometricTilesJob;
 use App\Jobs\RenderRegionIsometricImageJob;
 use Illuminate\Bus\Batchable;
 use Illuminate\Contracts\Queue\ShouldQueue;
@@ -50,10 +49,7 @@ it('queues isometric map jobs through the api', function () {
         Bus::assertBatched(function ($batch): bool {
             return count($batch->jobs) > 0
                 && collect($batch->jobs)->every(
-                    fn (mixed $jobs): bool => is_array($jobs)
-                        && count($jobs) === 2
-                        && $jobs[0] instanceof RenderRegionIsometricImageJob
-                        && $jobs[1] instanceof GenerateRegionIsometricTilesJob
+                    fn (mixed $job): bool => $job instanceof RenderRegionIsometricImageJob
                 );
         });
 

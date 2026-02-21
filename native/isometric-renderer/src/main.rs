@@ -8,6 +8,9 @@ use std::process::ExitCode;
 const DEPTH_SCALE: f64 = 0.6;
 const HEIGHT_BASELINE: i32 = -128;
 const HEIGHT_CEILING: i32 = 384;
+const HORIZONTAL_PADDING: i32 = 1;
+const TOP_PADDING: i32 = 1;
+const BOTTOM_PADDING: usize = 8;
 
 type RunsEntry = (u32, Vec<i32>);
 
@@ -112,7 +115,12 @@ fn write_png(path: &str, width: usize, height: usize, rgba: &[u8]) -> Result<(),
     Ok(())
 }
 
-fn read_packed_bits(words: &[LongWord], long_index: usize, bit_offset: usize, bit_count: usize) -> u32 {
+fn read_packed_bits(
+    words: &[LongWord],
+    long_index: usize,
+    bit_offset: usize,
+    bit_count: usize,
+) -> u32 {
     if long_index >= words.len() || bit_count == 0 {
         return 0;
     }
@@ -153,7 +161,12 @@ fn read_packed_bits(words: &[LongWord], long_index: usize, bit_offset: usize, bi
     (first_part | (second_part << first_part_bit_count)) as u32
 }
 
-fn palette_index_at(section: &SectionInput, local_x: usize, local_z: usize, local_y: usize) -> usize {
+fn palette_index_at(
+    section: &SectionInput,
+    local_x: usize,
+    local_z: usize,
+    local_y: usize,
+) -> usize {
     let Some(bits_per_entry_u8) = section.bits_per_entry else {
         return 0;
     };
@@ -176,15 +189,24 @@ fn palette_index_at(section: &SectionInput, local_x: usize, local_z: usize, loca
         let index_in_long = block_index % values_per_long;
         let bit_offset = index_in_long * bits_per_entry;
 
-        return read_packed_bits(&section.block_data_words, long_index, bit_offset, bits_per_entry)
-            as usize;
+        return read_packed_bits(
+            &section.block_data_words,
+            long_index,
+            bit_offset,
+            bits_per_entry,
+        ) as usize;
     }
 
     let start_bit = block_index * bits_per_entry;
     let long_index = start_bit / 64;
     let bit_offset = start_bit % 64;
 
-    read_packed_bits(&section.block_data_words, long_index, bit_offset, bits_per_entry) as usize
+    read_packed_bits(
+        &section.block_data_words,
+        long_index,
+        bit_offset,
+        bits_per_entry,
+    ) as usize
 }
 
 fn is_air_palette(section: &SectionInput, palette_index: usize) -> bool {
@@ -280,6 +302,19 @@ fn main() -> ExitCode {
     };
     let source_height = match parse_u32_arg(&args, "--source-height") {
         Ok(value) => value as usize,
+        Err(error) => {
+            eprintln!("{error}");
+
+            return ExitCode::from(2);
+        }
+    };
+    let pixel_scale = match parse_u32_arg(&args, "--pixel-scale") {
+        Ok(value) if value > 0 => value as usize,
+        Ok(_) => {
+            eprintln!("invalid unsigned integer for --pixel-scale: 0");
+
+            return ExitCode::from(2);
+        }
         Err(error) => {
             eprintln!("{error}");
 
@@ -513,10 +548,17 @@ fn main() -> ExitCode {
     }
 
     let vertical_depth_padding = (height_span as f64 * DEPTH_SCALE).ceil() as i32;
-    let iso_width = source_width + source_height;
-    let iso_height = ((source_width + source_height) as f64 / 2.0).ceil() as usize
-        + vertical_depth_padding as usize
-        + 8usize;
+    let min_depth_offset = depth_offset_for_height(min_y + 1);
+    let max_depth_offset = depth_offset_for_height(max_y + 1);
+    let vertical_shift = (max_depth_offset - vertical_depth_padding).max(0) + TOP_PADDING;
+    let logical_iso_width = source_width + source_height + ((HORIZONTAL_PADDING * 2) as usize);
+    let max_iso_base_y = ((source_width + source_height - 2) as f64 / 2.0).floor() as i32
+        + vertical_depth_padding
+        + vertical_shift;
+    let max_projected_y = max_iso_base_y - min_depth_offset + 1;
+    let logical_iso_height = (max_projected_y.max(0) as usize) + 1 + BOTTOM_PADDING;
+    let iso_width = logical_iso_width * pixel_scale;
+    let iso_height = logical_iso_height * pixel_scale;
     let image_pixel_count = iso_width * iso_height;
     let mut rgba = vec![0u8; image_pixel_count * 4];
     let mut depth_buffer = vec![i32::MIN; image_pixel_count];
@@ -537,8 +579,9 @@ fn main() -> ExitCode {
     for column_index in 0..total_columns {
         let world_x = (column_index % source_width) as i32;
         let world_z = (column_index / source_width) as i32;
-        column_iso_base[column_index] =
-            ((world_x + world_z) as f64 / 2.0).floor() as i32 + vertical_depth_padding;
+        column_iso_base[column_index] = ((world_x + world_z) as f64 / 2.0).floor() as i32
+            + vertical_depth_padding
+            + vertical_shift;
     }
 
     let mut runs_lookup: HashMap<u32, usize> = HashMap::with_capacity(runs.len());
@@ -552,25 +595,32 @@ fn main() -> ExitCode {
                 return;
             }
 
-            let x = x as usize;
-            let y = y as usize;
+            let logical_x = x as usize;
+            let logical_y = y as usize;
 
-            if x >= iso_width || y >= iso_height {
+            if logical_x >= logical_iso_width || logical_y >= logical_iso_height {
                 return;
             }
 
-            let index = (y * iso_width) + x;
+            let base_x = logical_x * pixel_scale;
+            let base_y = logical_y * pixel_scale;
 
-            if depth_buffer[index] > depth {
-                return;
+            for scale_y in 0..pixel_scale {
+                for scale_x in 0..pixel_scale {
+                    let index = ((base_y + scale_y) * iso_width) + (base_x + scale_x);
+
+                    if depth_buffer[index] > depth {
+                        continue;
+                    }
+
+                    depth_buffer[index] = depth;
+                    let rgba_offset = index * 4;
+                    rgba[rgba_offset] = red;
+                    rgba[rgba_offset + 1] = green;
+                    rgba[rgba_offset + 2] = blue;
+                    rgba[rgba_offset + 3] = alpha;
+                }
             }
-
-            depth_buffer[index] = depth;
-            let rgba_offset = index * 4;
-            rgba[rgba_offset] = red;
-            rgba[rgba_offset + 1] = green;
-            rgba[rgba_offset + 2] = blue;
-            rgba[rgba_offset + 3] = alpha;
         };
 
     for (column_index_u32, runs_values) in &runs {
@@ -583,7 +633,7 @@ fn main() -> ExitCode {
         let mut pending_shadow_source_y: Option<i32> = None;
         let column_voxel_base_index = column_index * height_span;
         let column_depth_base = (world_x + world_z) * 8192;
-        let iso_x = (world_x - world_z) + (source_height as i32 - 1);
+        let iso_x = (world_x - world_z) + (source_height as i32 - 1) + HORIZONTAL_PADDING;
         let east_at_boundary = world_x + 1 >= source_width as i32;
         let south_at_boundary = world_z + 1 >= source_height as i32;
         let east_neighbor_runs = if east_at_boundary {
@@ -689,8 +739,7 @@ fn main() -> ExitCode {
                             let y_offset = (world_y - min_y) as usize;
                             let voxel_index = column_voxel_base_index + y_offset;
                             let (red, green, blue) = color_at(&colors, voxel_index);
-                            let iso_y =
-                                iso_base_y - depth_offsets_by_y[(world_y - min_y) as usize];
+                            let iso_y = iso_base_y - depth_offsets_by_y[(world_y - min_y) as usize];
                             let base_depth = column_depth_base + (world_y * 4);
                             plot_pixel_if_closer(
                                 iso_x + 1,
@@ -778,8 +827,7 @@ fn main() -> ExitCode {
                             let y_offset = (world_y - min_y) as usize;
                             let voxel_index = column_voxel_base_index + y_offset;
                             let (red, green, blue) = color_at(&colors, voxel_index);
-                            let iso_y =
-                                iso_base_y - depth_offsets_by_y[(world_y - min_y) as usize];
+                            let iso_y = iso_base_y - depth_offsets_by_y[(world_y - min_y) as usize];
                             let base_depth = column_depth_base + (world_y * 4);
                             plot_pixel_if_closer(
                                 iso_x - 1,

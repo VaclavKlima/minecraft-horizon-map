@@ -7,5 +7,6 @@ return [
         base_path('native/isometric-renderer/target/release/isometric-renderer'.(PHP_OS_FAMILY === 'Windows' ? '.exe' : ''))
     ),
     'isometric_native_timeout_seconds' => (int) env('ISOMETRIC_NATIVE_RENDERER_TIMEOUT_SECONDS', 300),
+    'isometric_native_pixel_scale' => max(1, (int) env('ISOMETRIC_NATIVE_RENDERER_PIXEL_SCALE', 2)),
     'isometric_profile_enabled' => env('ISOMETRIC_RENDER_PROFILE_ENABLED', false),
 ];
