@@ -356,75 +356,9 @@ class MinecraftIsometricTileService
             ];
         }
 
-        $regions = $this->largestConnectedRegionGroup($regions);
         usort($regions, fn (array $left, array $right): int => $left['file'] <=> $right['file']);
 
         return $regions;
-    }
-
-    /**
-     * @param  array<int, array{file:string, region_x:int, region_z:int}>  $regions
-     * @return array<int, array{file:string, region_x:int, region_z:int}>
-     */
-    private function largestConnectedRegionGroup(array $regions): array
-    {
-        if ($regions === []) {
-            return [];
-        }
-
-        $indexByCoordinate = [];
-
-        foreach ($regions as $index => $region) {
-            $indexByCoordinate[$region['region_x'].':'.$region['region_z']] = $index;
-        }
-
-        $visited = [];
-        $largestComponent = [];
-
-        foreach ($regions as $startIndex => $region) {
-            if (isset($visited[$startIndex])) {
-                continue;
-            }
-
-            $queue = [$startIndex];
-            $visited[$startIndex] = true;
-            $component = [];
-
-            while ($queue !== []) {
-                $currentIndex = array_pop($queue);
-                $component[] = $regions[$currentIndex];
-                $current = $regions[$currentIndex];
-
-                for ($deltaX = -1; $deltaX <= 1; $deltaX++) {
-                    for ($deltaZ = -1; $deltaZ <= 1; $deltaZ++) {
-                        if ($deltaX === 0 && $deltaZ === 0) {
-                            continue;
-                        }
-
-                        $neighborKey = ($current['region_x'] + $deltaX).':'.($current['region_z'] + $deltaZ);
-
-                        if (! isset($indexByCoordinate[$neighborKey])) {
-                            continue;
-                        }
-
-                        $neighborIndex = $indexByCoordinate[$neighborKey];
-
-                        if (isset($visited[$neighborIndex])) {
-                            continue;
-                        }
-
-                        $visited[$neighborIndex] = true;
-                        $queue[] = $neighborIndex;
-                    }
-                }
-            }
-
-            if (count($component) > count($largestComponent)) {
-                $largestComponent = $component;
-            }
-        }
-
-        return $largestComponent !== [] ? $largestComponent : $regions;
     }
 
     /**
@@ -503,7 +437,12 @@ class MinecraftIsometricTileService
         $parts = [];
 
         foreach ($regions as $region) {
-            $parts[] = $region['file'].':'.$this->files->lastModified($this->sourceMapPath($region['file']));
+            $sourcePath = $this->sourceMapPath($region['file']);
+            $parts[] = implode(':', [
+                $region['file'],
+                (string) $this->files->lastModified($sourcePath),
+                (string) $this->files->size($sourcePath),
+            ]);
         }
 
         return sha1(implode('|', $parts));

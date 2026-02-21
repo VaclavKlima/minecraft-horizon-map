@@ -50,7 +50,8 @@ class RegionDataController extends Controller
     {
         try {
             $result = $this->dispatchBirdsEyeMapBatch->dispatch(
-                $request->string('heightmap', 'WORLD_SURFACE')->toString()
+                $request->string('heightmap', 'WORLD_SURFACE')->toString(),
+                $this->priorityContextFromRequest($request)
             );
 
             return response()->json($result, 202);
@@ -65,7 +66,8 @@ class RegionDataController extends Controller
     {
         try {
             $result = $this->dispatchIsometricMapBatch->dispatch(
-                $request->string('heightmap', 'WORLD_SURFACE')->toString()
+                $request->string('heightmap', 'WORLD_SURFACE')->toString(),
+                $this->priorityContextFromRequest($request)
             );
 
             return response()->json($result, 202);
@@ -103,5 +105,40 @@ class RegionDataController extends Controller
             'finished' => $batch->finished(),
             'cancelled' => $batch->cancelled(),
         ]);
+    }
+
+    /**
+     * @return array{
+     *     focus_world_x:int|null,
+     *     focus_world_z:int|null,
+     *     viewport_min_world_x:int|null,
+     *     viewport_min_world_z:int|null,
+     *     viewport_max_world_x:int|null,
+     *     viewport_max_world_z:int|null,
+     *     priority_regions:array<int,string>
+     * }
+     */
+    private function priorityContextFromRequest(RenderBirdsEyeMapRequest $request): array
+    {
+        $parseOptionalInt = static function (string $key) use ($request): ?int {
+            if (! $request->has($key)) {
+                return null;
+            }
+
+            return (int) $request->input($key);
+        };
+
+        return [
+            'focus_world_x' => $parseOptionalInt('focus_world_x'),
+            'focus_world_z' => $parseOptionalInt('focus_world_z'),
+            'viewport_min_world_x' => $parseOptionalInt('viewport_min_world_x'),
+            'viewport_min_world_z' => $parseOptionalInt('viewport_min_world_z'),
+            'viewport_max_world_x' => $parseOptionalInt('viewport_max_world_x'),
+            'viewport_max_world_z' => $parseOptionalInt('viewport_max_world_z'),
+            'priority_regions' => array_values(array_unique(array_filter(
+                array_map('strval', (array) $request->input('priority_regions', [])),
+                static fn (string $region): bool => preg_match('/^r\.-?\d+\.-?\d+\.mca$/', $region) === 1
+            ))),
+        ];
     }
 }

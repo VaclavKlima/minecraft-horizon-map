@@ -11,6 +11,8 @@ const HEIGHT_CEILING: i32 = 384;
 const HORIZONTAL_PADDING: i32 = 1;
 const TOP_PADDING: i32 = 1;
 const BOTTOM_PADDING: usize = 8;
+const SHADOW_TINT_COLOR: [u8; 3] = [92, 106, 134];
+const SHADOW_TINT_STRENGTH: f64 = 0.22;
 
 type RunsEntry = (u32, Vec<i32>);
 
@@ -32,12 +34,21 @@ struct ChunkInput {
 struct SectionInput {
     section_y: i32,
     palette_is_air: Vec<bool>,
+    palette_is_water: Vec<bool>,
+    palette_uses_grass_tint: Vec<bool>,
+    palette_uses_foliage_tint: Vec<bool>,
     palette_colors: Vec<[u8; 3]>,
     uniform_palette_index: Option<usize>,
     block_data_words: Vec<LongWord>,
     bits_per_entry: Option<u8>,
     values_per_long: Option<usize>,
     uses_padded_layout: bool,
+    biome_palette_tints: Vec<[u8; 3]>,
+    biome_uniform_palette_index: Option<usize>,
+    biome_data_words: Vec<LongWord>,
+    biome_bits_per_entry: Option<u8>,
+    biome_values_per_long: Option<usize>,
+    biome_uses_padded_layout: bool,
 }
 
 #[derive(Deserialize)]
@@ -127,6 +138,21 @@ fn apply_height_shading(
         apply_brightness(green, brightness_factor),
         apply_brightness(blue, brightness_factor),
     )
+}
+
+fn apply_water_depth_shading(red: u8, green: u8, blue: u8, water_depth: u16) -> (u8, u8, u8) {
+    if water_depth <= 1 {
+        return (red, green, blue);
+    }
+
+    let depth_steps = (water_depth.saturating_sub(1).min(20)) as f64;
+    let brightness_factor = 1.0 - (depth_steps * 0.03);
+    let depth_blue_lift = (depth_steps * 1.2).round() as i32;
+    let shaded_red = apply_brightness(red, brightness_factor);
+    let shaded_green = apply_brightness(green, brightness_factor);
+    let shaded_blue = apply_brightness(blue, brightness_factor) as i32 + depth_blue_lift;
+
+    (shaded_red, shaded_green, shaded_blue.clamp(0, 255) as u8)
 }
 
 fn write_png(path: &str, width: usize, height: usize, rgba: &[u8]) -> Result<(), String> {
@@ -248,12 +274,144 @@ fn is_air_palette(section: &SectionInput, palette_index: usize) -> bool {
         .unwrap_or(true)
 }
 
+fn is_water_palette(section: &SectionInput, palette_index: usize) -> bool {
+    section
+        .palette_is_water
+        .get(palette_index)
+        .copied()
+        .unwrap_or(false)
+}
+
+fn uses_grass_tint(section: &SectionInput, palette_index: usize) -> bool {
+    section
+        .palette_uses_grass_tint
+        .get(palette_index)
+        .copied()
+        .unwrap_or(false)
+}
+
+fn uses_foliage_tint(section: &SectionInput, palette_index: usize) -> bool {
+    section
+        .palette_uses_foliage_tint
+        .get(palette_index)
+        .copied()
+        .unwrap_or(false)
+}
+
 fn palette_color(section: &SectionInput, palette_index: usize) -> [u8; 3] {
     section
         .palette_colors
         .get(palette_index)
         .copied()
         .unwrap_or([90, 90, 92])
+}
+
+fn biome_palette_index_at(
+    section: &SectionInput,
+    local_x: usize,
+    local_z: usize,
+    local_y: usize,
+) -> usize {
+    if let Some(uniform_palette_index) = section.biome_uniform_palette_index {
+        return uniform_palette_index;
+    }
+
+    let Some(bits_per_entry_u8) = section.biome_bits_per_entry else {
+        return 0;
+    };
+
+    if section.biome_data_words.is_empty() {
+        return 0;
+    }
+
+    let biome_x = local_x / 4;
+    let biome_z = local_z / 4;
+    let biome_y = local_y / 4;
+    let biome_index = (biome_y * 16) + (biome_z * 4) + biome_x;
+    let bits_per_entry = bits_per_entry_u8 as usize;
+
+    if section.biome_uses_padded_layout {
+        let values_per_long = section.biome_values_per_long.unwrap_or(0);
+
+        if values_per_long == 0 {
+            return 0;
+        }
+
+        let long_index = biome_index / values_per_long;
+        let index_in_long = biome_index % values_per_long;
+        let bit_offset = index_in_long * bits_per_entry;
+
+        return read_packed_bits(
+            &section.biome_data_words,
+            long_index,
+            bit_offset,
+            bits_per_entry,
+        ) as usize;
+    }
+
+    let start_bit = biome_index * bits_per_entry;
+    let long_index = start_bit / 64;
+    let bit_offset = start_bit % 64;
+
+    read_packed_bits(
+        &section.biome_data_words,
+        long_index,
+        bit_offset,
+        bits_per_entry,
+    ) as usize
+}
+
+fn biome_tint(section: &SectionInput, palette_index: usize) -> [u8; 3] {
+    section
+        .biome_palette_tints
+        .get(palette_index)
+        .copied()
+        .unwrap_or([255, 255, 255])
+}
+
+fn blend_tint(base: [u8; 3], tint: [u8; 3], strength: f64) -> [u8; 3] {
+    let tinted = [
+        ((base[0] as f64 * tint[0] as f64) / 255.0)
+            .round()
+            .clamp(0.0, 255.0) as u8,
+        ((base[1] as f64 * tint[1] as f64) / 255.0)
+            .round()
+            .clamp(0.0, 255.0) as u8,
+        ((base[2] as f64 * tint[2] as f64) / 255.0)
+            .round()
+            .clamp(0.0, 255.0) as u8,
+    ];
+    let clamped_strength = strength.clamp(0.0, 1.0);
+
+    [
+        (base[0] as f64 + ((tinted[0] as f64 - base[0] as f64) * clamped_strength))
+            .round()
+            .clamp(0.0, 255.0) as u8,
+        (base[1] as f64 + ((tinted[1] as f64 - base[1] as f64) * clamped_strength))
+            .round()
+            .clamp(0.0, 255.0) as u8,
+        (base[2] as f64 + ((tinted[2] as f64 - base[2] as f64) * clamped_strength))
+            .round()
+            .clamp(0.0, 255.0) as u8,
+    ]
+}
+
+fn apply_shadow_tint(red: u8, green: u8, blue: u8) -> (u8, u8, u8) {
+    let strength = SHADOW_TINT_STRENGTH.clamp(0.0, 1.0);
+    let mixed_red = (red as f64 * (1.0 - strength) + SHADOW_TINT_COLOR[0] as f64 * strength)
+        .round()
+        .max((red as f64 * 0.55) + 24.0)
+        .min(255.0) as u8;
+    let mixed_green = (green as f64 * (1.0 - strength) + SHADOW_TINT_COLOR[1] as f64 * strength)
+        .round()
+        .max((green as f64 * 0.55) + 24.0)
+        .min(255.0) as u8;
+    let mixed_blue = (blue as f64 * (1.0 - strength) + SHADOW_TINT_COLOR[2] as f64 * strength)
+        .round()
+        .max((blue as f64 * 0.55) + 24.0)
+        .min(255.0) as u8;
+
+    (mixed_red, mixed_green, mixed_blue)
 }
 
 fn chunk_local_bounds(
@@ -280,12 +438,14 @@ fn chunk_local_bounds(
 fn set_voxel(
     occupancy: &mut [u8],
     colors: &mut [u8],
+    water_mask: &mut [u8],
     source_width: usize,
     height_span: usize,
     world_x: usize,
     world_z: usize,
     y_offset: usize,
     color: [u8; 3],
+    is_water: bool,
 ) {
     let column_index = (world_z * source_width) + world_x;
     let voxel_index = (column_index * height_span) + y_offset;
@@ -297,6 +457,7 @@ fn set_voxel(
     colors[color_offset] = color[0];
     colors[color_offset + 1] = color[1];
     colors[color_offset + 2] = color[2];
+    water_mask[voxel_index] = if is_water { 1 } else { 0 };
 }
 
 fn is_voxel_solid(occupancy: &[u8], voxel_index: usize) -> bool {
@@ -454,6 +615,7 @@ fn main() -> ExitCode {
     let total_voxels = total_columns * height_span;
     let mut occupancy = vec![0u8; (total_voxels + 7) / 8];
     let mut colors = vec![0u8; total_voxels * 3];
+    let mut water_mask = vec![0u8; total_voxels];
 
     for chunk in &input.chunks {
         let Some((min_local_x, max_local_x, min_local_z, max_local_z)) =
@@ -472,6 +634,7 @@ fn main() -> ExitCode {
                 }
 
                 let color = palette_color(section, uniform_palette_index);
+                let is_water = is_water_palette(section, uniform_palette_index);
 
                 for local_y in 0..16usize {
                     let world_y = (section.section_y * 16) + local_y as i32;
@@ -487,15 +650,27 @@ fn main() -> ExitCode {
 
                         for local_x in min_local_x..=max_local_x {
                             let world_x = (chunk_base_x + local_x as i32) as usize;
+                            let biome_index =
+                                biome_palette_index_at(section, local_x, local_z, local_y);
+                            let biome_tint = biome_tint(section, biome_index);
+                            let tinted_color = if uses_grass_tint(section, uniform_palette_index) {
+                                blend_tint(color, biome_tint, 0.45)
+                            } else if uses_foliage_tint(section, uniform_palette_index) {
+                                blend_tint(color, biome_tint, 0.55)
+                            } else {
+                                color
+                            };
                             set_voxel(
                                 &mut occupancy,
                                 &mut colors,
+                                &mut water_mask,
                                 source_width,
                                 height_span,
                                 world_x,
                                 world_z,
                                 y_offset,
-                                color,
+                                tinted_color,
+                                is_water,
                             );
                         }
                     }
@@ -524,19 +699,49 @@ fn main() -> ExitCode {
                         }
 
                         let color = palette_color(section, palette_index);
+                        let is_water = is_water_palette(section, palette_index);
+                        let biome_index =
+                            biome_palette_index_at(section, local_x, local_z, local_y);
+                        let biome_tint = biome_tint(section, biome_index);
+                        let tinted_color = if uses_grass_tint(section, palette_index) {
+                            blend_tint(color, biome_tint, 0.45)
+                        } else if uses_foliage_tint(section, palette_index) {
+                            blend_tint(color, biome_tint, 0.55)
+                        } else {
+                            color
+                        };
                         let world_x = (chunk_base_x + local_x as i32) as usize;
                         set_voxel(
                             &mut occupancy,
                             &mut colors,
+                            &mut water_mask,
                             source_width,
                             height_span,
                             world_x,
                             world_z,
                             y_offset,
-                            color,
+                            tinted_color,
+                            is_water,
                         );
                     }
                 }
+            }
+        }
+    }
+
+    let mut water_depths = vec![0u16; total_voxels];
+    for column_index in 0..total_columns {
+        let mut current_depth = 0u16;
+        let column_base_index = column_index * height_span;
+
+        for y_offset in (0..height_span).rev() {
+            let voxel_index = column_base_index + y_offset;
+
+            if is_voxel_solid(&occupancy, voxel_index) && water_mask[voxel_index] == 1 {
+                current_depth = current_depth.saturating_add(1);
+                water_depths[voxel_index] = current_depth;
+            } else {
+                current_depth = 0;
             }
         }
     }
@@ -594,10 +799,9 @@ fn main() -> ExitCode {
     let mut rgba = vec![0u8; image_pixel_count * 4];
     let mut depth_buffer = vec![i32::MIN; image_pixel_count];
 
-    let shadow_lut = lut(0.45);
     let east_lut = lut(0.8);
     let south_lut = lut(0.72);
-    let shadow_alpha = (((127 - 80) as f64 / 127.0) * 255.0).round() as u8;
+    let shadow_alpha = 176u8;
     let opaque_alpha = 255u8;
 
     let mut depth_offsets_by_y = vec![0i32; (max_y - min_y + 1) as usize];
@@ -699,12 +903,14 @@ fn main() -> ExitCode {
                     let underlay_iso_y =
                         iso_base_y - depth_offsets_by_y[(run_top - min_y) as usize];
                     let shadow_depth = column_depth_base + (run_top * 4) + 4;
+                    let (shadow_red, shadow_green, shadow_blue) =
+                        apply_shadow_tint(shade_red, shade_green, shade_blue);
                     plot_pixel_if_closer(
                         iso_x,
                         underlay_iso_y,
-                        shadow_lut[shade_red as usize],
-                        shadow_lut[shade_green as usize],
-                        shadow_lut[shade_blue as usize],
+                        shadow_red,
+                        shadow_green,
+                        shadow_blue,
                         shadow_alpha,
                         shadow_depth,
                     );
@@ -716,6 +922,16 @@ fn main() -> ExitCode {
             let (top_red, top_green, top_blue) = color_at(&colors, top_voxel_index);
             let (top_red, top_green, top_blue) =
                 apply_height_shading(top_red, top_green, top_blue, run_top, min_y, max_y);
+            let (top_red, top_green, top_blue) = if water_mask[top_voxel_index] == 1 {
+                apply_water_depth_shading(
+                    top_red,
+                    top_green,
+                    top_blue,
+                    water_depths[top_voxel_index],
+                )
+            } else {
+                (top_red, top_green, top_blue)
+            };
             let iso_y = iso_base_y - depth_offsets_by_y[(run_top - min_y) as usize];
             let base_depth = column_depth_base + (run_top * 4);
             plot_pixel_if_closer(

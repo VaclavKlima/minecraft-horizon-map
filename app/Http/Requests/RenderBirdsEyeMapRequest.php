@@ -24,6 +24,14 @@ class RenderBirdsEyeMapRequest extends FormRequest
                 'string',
                 'in:WORLD_SURFACE,WORLD_SURFACE_WG,OCEAN_FLOOR,OCEAN_FLOOR_WG,MOTION_BLOCKING,MOTION_BLOCKING_NO_LEAVES',
             ],
+            'focus_world_x' => ['sometimes', 'integer'],
+            'focus_world_z' => ['sometimes', 'integer'],
+            'viewport_min_world_x' => ['sometimes', 'integer'],
+            'viewport_min_world_z' => ['sometimes', 'integer'],
+            'viewport_max_world_x' => ['sometimes', 'integer'],
+            'viewport_max_world_z' => ['sometimes', 'integer'],
+            'priority_regions' => ['sometimes', 'array'],
+            'priority_regions.*' => ['string', 'regex:/^r\.-?\d+\.-?\d+\.mca$/'],
         ];
     }
 

@@ -869,12 +869,21 @@ class MinecraftBirdsEyeRenderer
             $sections[$section['y']] = [
                 'palette' => $section['palette'],
                 'palette_is_air' => $section['palette_is_air'],
+                'palette_is_water' => $section['palette_is_water'],
+                'palette_uses_grass_tint' => $section['palette_uses_grass_tint'],
+                'palette_uses_foliage_tint' => $section['palette_uses_foliage_tint'],
                 'palette_colors' => $section['palette_colors'],
                 'uniform_palette_index' => $section['uniform_palette_index'],
                 'block_data_words' => $section['block_data_words'],
                 'bits_per_entry' => $section['bits_per_entry'],
                 'values_per_long' => $section['values_per_long'],
                 'uses_padded_layout' => $section['uses_padded_layout'],
+                'biome_palette_tints' => $section['biome_palette_tints'],
+                'biome_uniform_palette_index' => $section['biome_uniform_palette_index'],
+                'biome_data_words' => $section['biome_data_words'],
+                'biome_bits_per_entry' => $section['biome_bits_per_entry'],
+                'biome_values_per_long' => $section['biome_values_per_long'],
+                'biome_uses_padded_layout' => $section['biome_uses_padded_layout'],
             ];
         }
 
@@ -886,12 +895,21 @@ class MinecraftBirdsEyeRenderer
      *     y:int,
      *     palette: array<int, string>,
      *     palette_is_air: array<int, bool>,
+     *     palette_is_water: array<int, bool>,
+     *     palette_uses_grass_tint: array<int, bool>,
+     *     palette_uses_foliage_tint: array<int, bool>,
      *     palette_colors: array<int, array{0:int,1:int,2:int}>,
      *     uniform_palette_index:?int,
      *     block_data_words: array<int, array{hi:int,lo:int}>,
      *     bits_per_entry:?int,
      *     values_per_long:?int,
-     *     uses_padded_layout:bool
+     *     uses_padded_layout:bool,
+     *     biome_palette_tints: array<int, array{0:int,1:int,2:int}>,
+     *     biome_uniform_palette_index:?int,
+     *     biome_data_words: array<int, array{hi:int,lo:int}>,
+     *     biome_bits_per_entry:?int,
+     *     biome_values_per_long:?int,
+     *     biome_uses_padded_layout:bool
      * }|null
      */
     private function readSectionCompound(string $binary, int &$cursor): ?array
@@ -899,6 +917,8 @@ class MinecraftBirdsEyeRenderer
         $sectionY = null;
         $palette = [];
         $blockData = [];
+        $biomePalette = [];
+        $biomeData = [];
 
         while (true) {
             $tagType = $this->readUnsignedByte($binary, $cursor);
@@ -921,6 +941,12 @@ class MinecraftBirdsEyeRenderer
                 continue;
             }
 
+            if ($tagName === 'biomes' && $tagType === 10) {
+                [$biomePalette, $biomeData] = $this->readBlockStatesCompound($binary, $cursor);
+
+                continue;
+            }
+
             $this->skipTagPayload($tagType, $binary, $cursor);
         }
 
@@ -929,10 +955,16 @@ class MinecraftBirdsEyeRenderer
         }
 
         $paletteIsAir = [];
+        $paletteIsWater = [];
+        $paletteUsesGrassTint = [];
+        $paletteUsesFoliageTint = [];
         $paletteColors = [];
 
         foreach ($palette as $index => $blockName) {
             $paletteIsAir[$index] = $this->isAirLikeBlock($blockName);
+            $paletteIsWater[$index] = $this->isWaterLikeBlock($blockName);
+            $paletteUsesGrassTint[$index] = $this->isGrassTintedBlock($blockName);
+            $paletteUsesFoliageTint[$index] = $this->isFoliageTintedBlock($blockName);
             $paletteColors[$index] = $this->colorForBlock($blockName);
         }
 
@@ -951,16 +983,50 @@ class MinecraftBirdsEyeRenderer
             $usesPaddedLayout = $valuesPerLong > 0 && (count($blockDataWords) * $valuesPerLong) >= 4096;
         }
 
+        $biomePaletteTints = [];
+        foreach ($biomePalette as $index => $biomeName) {
+            $biomePaletteTints[$index] = $this->tintForBiome($biomeName);
+        }
+
+        $biomeBitsPerEntry = null;
+        $biomeValuesPerLong = null;
+        $biomeUsesPaddedLayout = false;
+        $biomeDataWords = [];
+        $biomeUniformPaletteIndex = null;
+
+        if (count($biomePalette) === 1) {
+            $biomeUniformPaletteIndex = 0;
+        } elseif ($biomeData !== []) {
+            $biomeBitsPerEntry = max(1, (int) ceil(log(max(1, count($biomePalette)), 2)));
+            $biomeValuesPerLong = intdiv(64, $biomeBitsPerEntry);
+            $biomeDataWords = $this->unpackLongWords($biomeData);
+            $biomeUsesPaddedLayout = $biomeValuesPerLong > 0 && (count($biomeDataWords) * $biomeValuesPerLong) >= 64;
+        }
+
+        if ($biomePaletteTints === []) {
+            $biomePaletteTints[] = [255, 255, 255];
+            $biomeUniformPaletteIndex = 0;
+        }
+
         return [
             'y' => $sectionY,
             'palette' => $palette,
             'palette_is_air' => $paletteIsAir,
+            'palette_is_water' => $paletteIsWater,
+            'palette_uses_grass_tint' => $paletteUsesGrassTint,
+            'palette_uses_foliage_tint' => $paletteUsesFoliageTint,
             'palette_colors' => $paletteColors,
             'uniform_palette_index' => $uniformPaletteIndex,
             'block_data_words' => $blockDataWords,
             'bits_per_entry' => $bitsPerEntry,
             'values_per_long' => $valuesPerLong,
             'uses_padded_layout' => $usesPaddedLayout,
+            'biome_palette_tints' => $biomePaletteTints,
+            'biome_uniform_palette_index' => $biomeUniformPaletteIndex,
+            'biome_data_words' => $biomeDataWords,
+            'biome_bits_per_entry' => $biomeBitsPerEntry,
+            'biome_values_per_long' => $biomeValuesPerLong,
+            'biome_uses_padded_layout' => $biomeUsesPaddedLayout,
         ];
     }
 
@@ -1465,6 +1531,59 @@ class MinecraftBirdsEyeRenderer
     private function isAirLikeBlock(string $blockName): bool
     {
         return in_array($blockName, ['minecraft:air', 'minecraft:cave_air', 'minecraft:void_air'], true);
+    }
+
+    private function isWaterLikeBlock(string $blockName): bool
+    {
+        return in_array($blockName, ['minecraft:water', 'minecraft:bubble_column'], true);
+    }
+
+    private function isGrassTintedBlock(string $blockName): bool
+    {
+        return in_array($blockName, [
+            'minecraft:grass_block',
+            'minecraft:grass',
+            'minecraft:tall_grass',
+            'minecraft:short_grass',
+            'minecraft:large_fern',
+            'minecraft:fern',
+            'minecraft:pink_petals',
+            'minecraft:sugar_cane',
+            'minecraft:lily_pad',
+            'minecraft:vine',
+        ], true);
+    }
+
+    private function isFoliageTintedBlock(string $blockName): bool
+    {
+        if (str_contains($blockName, 'leaves')) {
+            return true;
+        }
+
+        return in_array($blockName, [
+            'minecraft:vine',
+            'minecraft:azalea_leaves',
+            'minecraft:flowering_azalea_leaves',
+            'minecraft:mangrove_roots',
+        ], true);
+    }
+
+    /**
+     * @return array{0:int,1:int,2:int}
+     */
+    private function tintForBiome(string $biomeName): array
+    {
+        return match ($biomeName) {
+            'minecraft:desert', 'minecraft:badlands', 'minecraft:eroded_badlands', 'minecraft:wooded_badlands' => [215, 190, 110],
+            'minecraft:savanna', 'minecraft:savanna_plateau', 'minecraft:windswept_savanna' => [195, 180, 90],
+            'minecraft:jungle', 'minecraft:bamboo_jungle' => [95, 180, 75],
+            'minecraft:swamp', 'minecraft:mangrove_swamp' => [110, 140, 95],
+            'minecraft:dark_forest', 'minecraft:old_growth_pine_taiga', 'minecraft:old_growth_spruce_taiga' => [95, 125, 80],
+            'minecraft:taiga', 'minecraft:snowy_taiga', 'minecraft:grove' => [120, 155, 110],
+            'minecraft:snowy_plains', 'minecraft:ice_spikes', 'minecraft:snowy_beach' => [175, 200, 175],
+            'minecraft:plains', 'minecraft:sunflower_plains', 'minecraft:meadow', 'minecraft:forest', 'minecraft:birch_forest', 'minecraft:flower_forest' => [140, 185, 115],
+            default => [130, 175, 110],
+        };
     }
 
     private function floorDivide(int $value, int $divisor): int

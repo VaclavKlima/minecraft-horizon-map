@@ -24,7 +24,7 @@ class MinecraftRegionReader
         $regionFiles = [];
 
         foreach ($this->files->files($directory) as $file) {
-            if ($file->getExtension() === 'mca') {
+            if (strtolower($file->getExtension()) === 'mca') {
                 $regionFiles[] = $file->getFilename();
             }
         }

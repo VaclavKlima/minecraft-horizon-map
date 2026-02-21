@@ -8,7 +8,7 @@ use RuntimeException;
 
 class MinecraftIsometricRenderer
 {
-    private const RENDER_METADATA_VERSION = 17;
+    private const RENDER_METADATA_VERSION = 18;
 
     public function __construct(
         private Filesystem $files,
@@ -93,7 +93,9 @@ class MinecraftIsometricRenderer
 
         return ($metadata['version'] ?? null) !== self::RENDER_METADATA_VERSION
             || ($metadata['heightmap_type'] ?? null) !== $heightmapType
-            || ($metadata['source_modified_at'] ?? null) !== $this->files->lastModified($sourcePath);
+            || ($metadata['source_modified_at'] ?? null) !== $this->files->lastModified($sourcePath)
+            || ($metadata['source_size_bytes'] ?? null) !== $this->files->size($sourcePath)
+            || ($metadata['source_changed_at'] ?? null) !== $this->sourceChangedAt($sourcePath);
     }
 
     private function regionPath(string $regionFile): string
@@ -117,6 +119,8 @@ class MinecraftIsometricRenderer
             'version' => self::RENDER_METADATA_VERSION,
             'heightmap_type' => $heightmapType,
             'source_modified_at' => $this->files->lastModified($this->regionPath($regionFile)),
+            'source_size_bytes' => $this->files->size($this->regionPath($regionFile)),
+            'source_changed_at' => $this->sourceChangedAt($this->regionPath($regionFile)),
             'rendered_at' => time(),
         ];
         $metadataPath = $this->renderMetadataPath($regionFile);
@@ -174,15 +178,35 @@ class MinecraftIsometricRenderer
             $normalizedSections[] = [
                 'section_y' => (int) $sectionY,
                 'palette_is_air' => $section['palette_is_air'],
+                'palette_is_water' => $section['palette_is_water'],
+                'palette_uses_grass_tint' => $section['palette_uses_grass_tint'],
+                'palette_uses_foliage_tint' => $section['palette_uses_foliage_tint'],
                 'palette_colors' => $section['palette_colors'],
                 'uniform_palette_index' => $section['uniform_palette_index'],
                 'block_data_words' => $section['block_data_words'],
                 'bits_per_entry' => $section['bits_per_entry'],
                 'values_per_long' => $section['values_per_long'],
                 'uses_padded_layout' => $section['uses_padded_layout'],
+                'biome_palette_tints' => $section['biome_palette_tints'],
+                'biome_uniform_palette_index' => $section['biome_uniform_palette_index'],
+                'biome_data_words' => $section['biome_data_words'],
+                'biome_bits_per_entry' => $section['biome_bits_per_entry'],
+                'biome_values_per_long' => $section['biome_values_per_long'],
+                'biome_uses_padded_layout' => $section['biome_uses_padded_layout'],
             ];
         }
 
         return $normalizedSections;
+    }
+
+    private function sourceChangedAt(string $sourcePath): int
+    {
+        $changedAt = @filectime($sourcePath);
+
+        if (! is_int($changedAt)) {
+            return $this->files->lastModified($sourcePath);
+        }
+
+        return $changedAt;
     }
 }
