@@ -113,19 +113,10 @@ fn apply_brightness(channel: u8, factor: f64) -> u8 {
     (channel as f64 * factor).round().clamp(0.0, 255.0) as u8
 }
 
-fn apply_height_shading(
-    red: u8,
-    green: u8,
-    blue: u8,
-    world_y: i32,
-    min_y: i32,
-    max_y: i32,
-) -> (u8, u8, u8) {
-    let normalized_height = if max_y == min_y {
-        0.5
-    } else {
-        (world_y - min_y) as f64 / (max_y - min_y) as f64
-    };
+fn apply_height_shading(red: u8, green: u8, blue: u8, world_y: i32) -> (u8, u8, u8) {
+    let normalized_height = (world_y.clamp(HEIGHT_BASELINE, HEIGHT_CEILING) - HEIGHT_BASELINE)
+        as f64
+        / (HEIGHT_CEILING - HEIGHT_BASELINE) as f64;
     let mut brightness_factor = 0.86 + (normalized_height * 0.28);
 
     // Subtle terrace cue every 8 levels to make vertical differences easier to read.
@@ -896,7 +887,7 @@ fn main() -> ExitCode {
                 let target_voxel_index = column_voxel_base_index + target_y_offset;
                 let (red, green, blue) = color_at(&colors, target_voxel_index);
                 let (shade_red, shade_green, shade_blue) =
-                    apply_height_shading(red, green, blue, run_top, min_y, max_y);
+                    apply_height_shading(red, green, blue, run_top);
                 let shadow_gap = shadow_source_y - run_top;
 
                 if shadow_gap >= 2 && (red != 0 || green != 0 || blue != 0) {
@@ -921,7 +912,7 @@ fn main() -> ExitCode {
             let top_voxel_index = column_voxel_base_index + top_y_offset;
             let (top_red, top_green, top_blue) = color_at(&colors, top_voxel_index);
             let (top_red, top_green, top_blue) =
-                apply_height_shading(top_red, top_green, top_blue, run_top, min_y, max_y);
+                apply_height_shading(top_red, top_green, top_blue, run_top);
             let (top_red, top_green, top_blue) = if water_mask[top_voxel_index] == 1 {
                 apply_water_depth_shading(
                     top_red,
@@ -950,8 +941,7 @@ fn main() -> ExitCode {
                     let y_offset = (world_y - min_y) as usize;
                     let voxel_index = column_voxel_base_index + y_offset;
                     let (red, green, blue) = color_at(&colors, voxel_index);
-                    let (red, green, blue) =
-                        apply_height_shading(red, green, blue, world_y, min_y, max_y);
+                    let (red, green, blue) = apply_height_shading(red, green, blue, world_y);
                     let iso_y = iso_base_y - depth_offsets_by_y[(world_y - min_y) as usize];
                     let base_depth = column_depth_base + (world_y * 4);
                     plot_pixel_if_closer(
@@ -993,7 +983,7 @@ fn main() -> ExitCode {
                             let voxel_index = column_voxel_base_index + y_offset;
                             let (red, green, blue) = color_at(&colors, voxel_index);
                             let (red, green, blue) =
-                                apply_height_shading(red, green, blue, world_y, min_y, max_y);
+                                apply_height_shading(red, green, blue, world_y);
                             let iso_y = iso_base_y - depth_offsets_by_y[(world_y - min_y) as usize];
                             let base_depth = column_depth_base + (world_y * 4);
                             plot_pixel_if_closer(
@@ -1022,8 +1012,7 @@ fn main() -> ExitCode {
                         let y_offset = (world_y - min_y) as usize;
                         let voxel_index = column_voxel_base_index + y_offset;
                         let (red, green, blue) = color_at(&colors, voxel_index);
-                        let (red, green, blue) =
-                            apply_height_shading(red, green, blue, world_y, min_y, max_y);
+                        let (red, green, blue) = apply_height_shading(red, green, blue, world_y);
                         let iso_y = iso_base_y - depth_offsets_by_y[(world_y - min_y) as usize];
                         let base_depth = column_depth_base + (world_y * 4);
                         plot_pixel_if_closer(
@@ -1044,8 +1033,7 @@ fn main() -> ExitCode {
                     let y_offset = (world_y - min_y) as usize;
                     let voxel_index = column_voxel_base_index + y_offset;
                     let (red, green, blue) = color_at(&colors, voxel_index);
-                    let (red, green, blue) =
-                        apply_height_shading(red, green, blue, world_y, min_y, max_y);
+                    let (red, green, blue) = apply_height_shading(red, green, blue, world_y);
                     let iso_y = iso_base_y - depth_offsets_by_y[(world_y - min_y) as usize];
                     let base_depth = column_depth_base + (world_y * 4);
                     plot_pixel_if_closer(
@@ -1087,7 +1075,7 @@ fn main() -> ExitCode {
                             let voxel_index = column_voxel_base_index + y_offset;
                             let (red, green, blue) = color_at(&colors, voxel_index);
                             let (red, green, blue) =
-                                apply_height_shading(red, green, blue, world_y, min_y, max_y);
+                                apply_height_shading(red, green, blue, world_y);
                             let iso_y = iso_base_y - depth_offsets_by_y[(world_y - min_y) as usize];
                             let base_depth = column_depth_base + (world_y * 4);
                             plot_pixel_if_closer(
@@ -1116,8 +1104,7 @@ fn main() -> ExitCode {
                         let y_offset = (world_y - min_y) as usize;
                         let voxel_index = column_voxel_base_index + y_offset;
                         let (red, green, blue) = color_at(&colors, voxel_index);
-                        let (red, green, blue) =
-                            apply_height_shading(red, green, blue, world_y, min_y, max_y);
+                        let (red, green, blue) = apply_height_shading(red, green, blue, world_y);
                         let iso_y = iso_base_y - depth_offsets_by_y[(world_y - min_y) as usize];
                         let base_depth = column_depth_base + (world_y * 4);
                         plot_pixel_if_closer(

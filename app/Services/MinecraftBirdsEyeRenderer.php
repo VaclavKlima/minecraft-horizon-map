@@ -9,6 +9,10 @@ class MinecraftBirdsEyeRenderer
 {
     private const RENDER_METADATA_VERSION = 7;
 
+    private const HEIGHT_BASELINE = -128;
+
+    private const HEIGHT_CEILING = 384;
+
     public function __construct(private Filesystem $files, private MinecraftRegionReader $minecraftRegionReader) {}
 
     /**
@@ -360,8 +364,6 @@ class MinecraftBirdsEyeRenderer
         imagefill($image, 0, 0, $backgroundColor);
 
         $colorCache = [];
-        $heightRange = max(1.0, $maxHeight - $minHeight);
-
         foreach ($preparedChunks as $chunk) {
             $basePixelX = $chunk['chunk_x'] * 16;
             $basePixelZ = $chunk['chunk_z'] * 16;
@@ -378,7 +380,8 @@ class MinecraftBirdsEyeRenderer
                     $southHeight = ($localZ < 15) ? $heights[(($localZ + 1) * 16) + $localX] : $height;
                     [$red, $green, $blue] = $colors[$index];
                     $slope = (($height - $eastHeight) + ($height - $southHeight)) / 2;
-                    $normalized = ($height - $minHeight) / $heightRange;
+                    $normalized = ($this->clampHeight($height) - self::HEIGHT_BASELINE)
+                        / (self::HEIGHT_CEILING - self::HEIGHT_BASELINE);
                     $heightBoost = 0.9 + ($normalized * 0.25);
                     $shadeFactor = max(0.65, min(1.25, (1 + ($slope / 14)) * $heightBoost));
                     $shadedRed = max(0, min(255, (int) round($red * $shadeFactor)));
@@ -625,10 +628,6 @@ class MinecraftBirdsEyeRenderer
         $cache = [];
         $heights = $chunkData['heights'];
         $colors = $chunkData['colors'];
-        $minHeight = min($heights);
-        $maxHeight = max($heights);
-        $heightRange = max(1.0, $maxHeight - $minHeight);
-
         for ($localZ = 0; $localZ < 16; $localZ++) {
             for ($localX = 0; $localX < 16; $localX++) {
                 $i = ($localZ * 16) + $localX;
@@ -637,7 +636,8 @@ class MinecraftBirdsEyeRenderer
                 $southHeight = $heights[(min($localZ + 1, 15) * 16) + $localX];
                 [$red, $green, $blue] = $colors[$i];
                 $slope = (($height - $eastHeight) + ($height - $southHeight)) / 2;
-                $normalized = ($height - $minHeight) / $heightRange;
+                $normalized = ($this->clampHeight($height) - self::HEIGHT_BASELINE)
+                    / (self::HEIGHT_CEILING - self::HEIGHT_BASELINE);
                 $shadeFactor = max(0.7, min(1.2, (1 + ($slope / 14)) * (0.92 + ($normalized * 0.2))));
                 $r = max(0, min(255, (int) round($red * $shadeFactor)));
                 $g = max(0, min(255, (int) round($green * $shadeFactor)));
@@ -1536,6 +1536,11 @@ class MinecraftBirdsEyeRenderer
     private function isWaterLikeBlock(string $blockName): bool
     {
         return in_array($blockName, ['minecraft:water', 'minecraft:bubble_column'], true);
+    }
+
+    private function clampHeight(int $height): int
+    {
+        return max(self::HEIGHT_BASELINE, min(self::HEIGHT_CEILING, $height));
     }
 
     private function isGrassTintedBlock(string $blockName): bool
