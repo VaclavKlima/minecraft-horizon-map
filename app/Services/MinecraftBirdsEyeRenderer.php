@@ -21,6 +21,11 @@ class MinecraftBirdsEyeRenderer
      */
     private array $loggedMissingColorBlocks = [];
 
+    /**
+     * @var array<string, array{0:int,1:int,2:int}>|null
+     */
+    private ?array $configuredBlockPalette = null;
+
     public function __construct(private Filesystem $files, private MinecraftRegionReader $minecraftRegionReader) {}
 
     /**
@@ -1469,22 +1474,43 @@ class MinecraftBirdsEyeRenderer
     /**
      * @return array{0:int,1:int,2:int}
      */
+    private function configuredBlockPalette(): array
+    {
+        if ($this->configuredBlockPalette !== null) {
+            return $this->configuredBlockPalette;
+        }
+
+        $configuredPalette = config('block-palette.palette', []);
+        $normalized = [];
+
+        if (is_array($configuredPalette)) {
+            foreach ($configuredPalette as $name => $color) {
+                if (! is_string($name) || ! is_array($color) || count($color) !== 3) {
+                    continue;
+                }
+
+                $normalized[$name] = [
+                    (int) $color[0],
+                    (int) $color[1],
+                    (int) $color[2],
+                ];
+            }
+        }
+
+        $this->configuredBlockPalette = $normalized;
+
+        return $this->configuredBlockPalette;
+    }
+
+    /**
+     * @return array{0:int,1:int,2:int}
+     */
     private function colorForBlock(string $blockName): array
     {
-        $explicitColor = match ($blockName) {
-            'minecraft:water', 'minecraft:bubble_column' => [52, 98, 182],
-            'minecraft:lava' => [238, 108, 34],
-            'minecraft:grass_block', 'minecraft:moss_block' => [106, 167, 69],
-            'minecraft:dirt', 'minecraft:coarse_dirt', 'minecraft:rooted_dirt', 'minecraft:podzol', 'minecraft:mud' => [122, 90, 62],
-            'minecraft:sand', 'minecraft:red_sand', 'minecraft:sandstone', 'minecraft:red_sandstone' => [210, 194, 140],
-            'minecraft:stone', 'minecraft:andesite', 'minecraft:diorite', 'minecraft:granite', 'minecraft:cobblestone' => [125, 125, 125],
-            'minecraft:deepslate', 'minecraft:cobbled_deepslate' => [78, 78, 84],
-            'minecraft:snow', 'minecraft:snow_block', 'minecraft:powder_snow' => [240, 243, 247],
-            default => null,
-        };
+        $configuredColor = $this->configuredBlockPalette()[$blockName] ?? null;
 
-        if ($explicitColor !== null) {
-            return $explicitColor;
+        if ($configuredColor !== null) {
+            return $configuredColor;
         }
 
         $this->logMissingColorBlock($blockName);
