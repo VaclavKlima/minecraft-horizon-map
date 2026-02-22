@@ -2,6 +2,7 @@
 
 namespace App\Services;
 
+use App\Jobs\GenerateBirdsEyeMinimapJob;
 use Illuminate\Filesystem\Filesystem;
 use RuntimeException;
 
@@ -15,13 +16,21 @@ class MinecraftMapTileService
 
     private const EAGER_OVERZOOM_LEVELS = 0;
 
+    private const MINIMAP_MAX_DIMENSION = 640;
+
+    private const MINIMAP_DISPATCH_COOLDOWN_SECONDS = 45;
+
     public function __construct(private Filesystem $files) {}
 
     /**
      * @return array<string, mixed>|null
      */
-    public function getManifest(?string $regionFile = null, bool $includeRegions = true, bool $refresh = true): ?array
-    {
+    public function getManifest(
+        ?string $regionFile = null,
+        bool $includeRegions = true,
+        bool $refresh = true,
+        bool $includeMinimap = true
+    ): ?array {
         if (! extension_loaded('gd')) {
             throw new RuntimeException('The GD extension is required to generate map tiles.');
         }
@@ -91,6 +100,14 @@ class MinecraftMapTileService
         $manifest['selected_region'] = $selectedRegion;
         $manifest['available_levels'] = $this->availableTileLevels($selectedRegion, $manifest);
 
+        if ($includeMinimap) {
+            $manifest['minimap'] = $this->buildMinimapDescriptor($selectedRegion, $manifest, false);
+
+            if ($manifest['minimap'] === null) {
+                $this->dispatchMinimapBuild($selectedRegion);
+            }
+        }
+
         if ($includeRegions) {
             $manifest['available_regions'] = array_values(array_unique(array_merge([self::ALL_REGIONS], array_column($availableRegions, 'file'))));
         }
@@ -100,7 +117,7 @@ class MinecraftMapTileService
 
     public function getTilePath(int $zoom, int $tileX, int $tileY, ?string $regionFile = null): ?string
     {
-        $manifest = $this->getManifest($regionFile, false, false);
+        $manifest = $this->getManifest($regionFile, false, false, false);
 
         if ($manifest === null) {
             return null;
@@ -159,6 +176,21 @@ class MinecraftMapTileService
 
         $this->ensureCombinedManifestIsFresh($regions);
         $this->generateAllTilesFromManifest(self::ALL_REGIONS, true);
+    }
+
+    public function rebuildMinimap(?string $regionFile = null): void
+    {
+        $selectedRegion = $regionFile ?? self::ALL_REGIONS;
+        $manifestPath = $this->manifestPath($selectedRegion);
+
+        if (! $this->files->exists($manifestPath)) {
+            return;
+        }
+
+        /** @var array<string, mixed> $manifest */
+        $manifest = json_decode($this->files->get($manifestPath), true, flags: JSON_THROW_ON_ERROR);
+        $this->buildMinimapDescriptor($selectedRegion, $manifest, true);
+        $this->clearMinimapDispatchLock($selectedRegion);
     }
 
     private function ensureManifestIsFresh(string $regionFile): void
@@ -596,6 +628,353 @@ class MinecraftMapTileService
         }
 
         return [];
+    }
+
+    /**
+     * @param  array<string, mixed>  $manifest
+     * @return array{
+     *   url:string,
+     *   width:int,
+     *   height:int,
+     *   source_width:int,
+     *   source_height:int
+     * }|null
+     */
+    private function buildMinimapDescriptor(string $selectedRegion, array $manifest, bool $allowBuild): ?array
+    {
+        if ($selectedRegion === self::ALL_REGIONS) {
+            return $this->buildCombinedMinimapDescriptor($manifest, $allowBuild);
+        }
+
+        return $this->buildRegionMinimapDescriptor($selectedRegion, $allowBuild);
+    }
+
+    /**
+     * @param  array<string, mixed>  $manifest
+     * @return array{
+     *   url:string,
+     *   width:int,
+     *   height:int,
+     *   source_width:int,
+     *   source_height:int
+     * }|null
+     */
+    private function buildCombinedMinimapDescriptor(array $manifest, bool $allowBuild): ?array
+    {
+        $sourceWidth = (int) ($manifest['source_width'] ?? 0);
+        $sourceHeight = (int) ($manifest['source_height'] ?? 0);
+        $sourceSignature = (string) ($manifest['source_signature'] ?? '');
+        $generatedAt = (int) ($manifest['generated_at'] ?? 0);
+        $regions = $manifest['regions'] ?? [];
+
+        if ($sourceWidth <= 0 || $sourceHeight <= 0 || $sourceSignature === '' || ! is_array($regions)) {
+            return null;
+        }
+
+        $relativeImagePath = 'maps/minimap/all.png';
+        $imagePath = public_path($relativeImagePath);
+        $metaPath = public_path('maps/minimap/all.meta.json');
+        $signature = sha1($sourceSignature.'|'.$sourceWidth.'|'.$sourceHeight);
+
+        if (! $this->isMinimapFresh($imagePath, $metaPath, $signature)) {
+            if (! $allowBuild) {
+                if (! $this->files->exists($imagePath) || ! $this->files->exists($metaPath)) {
+                    return null;
+                }
+            } else {
+                $this->safeEnsureDirectoryExists(dirname($imagePath));
+                $built = $this->buildCombinedMinimapImage($imagePath, $manifest, $sourceWidth, $sourceHeight);
+
+                if ($built === null) {
+                    return null;
+                }
+
+                $this->files->put(
+                    $metaPath,
+                    json_encode([
+                        'signature' => $signature,
+                        'width' => $built['width'],
+                        'height' => $built['height'],
+                    ], JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR)
+                );
+            }
+        }
+
+        /** @var array<string, mixed> $meta */
+        $meta = json_decode($this->files->get($metaPath), true, flags: JSON_THROW_ON_ERROR);
+        $minimapWidth = (int) ($meta['width'] ?? 0);
+        $minimapHeight = (int) ($meta['height'] ?? 0);
+
+        if ($minimapWidth <= 0 || $minimapHeight <= 0) {
+            return null;
+        }
+
+        return [
+            'url' => '/'.$relativeImagePath.'?t='.$generatedAt,
+            'width' => $minimapWidth,
+            'height' => $minimapHeight,
+            'source_width' => $sourceWidth,
+            'source_height' => $sourceHeight,
+        ];
+    }
+
+    /**
+     * @return array{
+     *   url:string,
+     *   width:int,
+     *   height:int,
+     *   source_width:int,
+     *   source_height:int
+     * }|null
+     */
+    private function buildRegionMinimapDescriptor(string $regionFile, bool $allowBuild): ?array
+    {
+        $sourcePath = $this->sourceMapPath($regionFile);
+
+        if (! $this->files->exists($sourcePath)) {
+            return null;
+        }
+
+        [$sourceWidth, $sourceHeight] = getimagesize($sourcePath) ?: [0, 0];
+        if ($sourceWidth <= 0 || $sourceHeight <= 0) {
+            return null;
+        }
+
+        $regionKey = $this->regionKey($regionFile);
+        $relativeImagePath = 'maps/minimap/'.$regionKey.'.png';
+        $imagePath = public_path($relativeImagePath);
+        $metaPath = public_path('maps/minimap/'.$regionKey.'.meta.json');
+        $signature = sha1((string) $this->files->lastModified($sourcePath).'|'.(string) $this->files->size($sourcePath));
+
+        if (! $this->isMinimapFresh($imagePath, $metaPath, $signature)) {
+            if (! $allowBuild) {
+                if (! $this->files->exists($imagePath) || ! $this->files->exists($metaPath)) {
+                    return null;
+                }
+            } else {
+                $this->safeEnsureDirectoryExists(dirname($imagePath));
+                $built = $this->buildSingleImageMinimap($sourcePath, $imagePath, $sourceWidth, $sourceHeight);
+
+                if ($built === null) {
+                    return null;
+                }
+
+                $this->files->put(
+                    $metaPath,
+                    json_encode([
+                        'signature' => $signature,
+                        'width' => $built['width'],
+                        'height' => $built['height'],
+                    ], JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR)
+                );
+            }
+        }
+
+        /** @var array<string, mixed> $meta */
+        $meta = json_decode($this->files->get($metaPath), true, flags: JSON_THROW_ON_ERROR);
+        $minimapWidth = (int) ($meta['width'] ?? 0);
+        $minimapHeight = (int) ($meta['height'] ?? 0);
+
+        if ($minimapWidth <= 0 || $minimapHeight <= 0) {
+            return null;
+        }
+
+        return [
+            'url' => '/'.$relativeImagePath.'?t='.$this->files->lastModified($sourcePath),
+            'width' => $minimapWidth,
+            'height' => $minimapHeight,
+            'source_width' => (int) $sourceWidth,
+            'source_height' => (int) $sourceHeight,
+        ];
+    }
+
+    private function isMinimapFresh(string $imagePath, string $metaPath, string $signature): bool
+    {
+        if (! $this->files->exists($imagePath) || ! $this->files->exists($metaPath)) {
+            return false;
+        }
+
+        try {
+            /** @var array<string, mixed> $meta */
+            $meta = json_decode($this->files->get($metaPath), true, flags: JSON_THROW_ON_ERROR);
+        } catch (\Throwable) {
+            return false;
+        }
+
+        return (string) ($meta['signature'] ?? '') === $signature;
+    }
+
+    /**
+     * @param  array<string, mixed>  $manifest
+     * @return array{width:int,height:int}|null
+     */
+    private function buildCombinedMinimapImage(
+        string $outputPath,
+        array $manifest,
+        int $sourceWidth,
+        int $sourceHeight
+    ): ?array {
+        $regions = $manifest['regions'] ?? [];
+
+        if (! is_array($regions)) {
+            return null;
+        }
+
+        $scale = min(
+            1.0,
+            self::MINIMAP_MAX_DIMENSION / max(1, max($sourceWidth, $sourceHeight))
+        );
+        $targetWidth = max(1, (int) floor($sourceWidth * $scale));
+        $targetHeight = max(1, (int) floor($sourceHeight * $scale));
+        $canvas = imagecreatetruecolor($targetWidth, $targetHeight);
+
+        if ($canvas === false) {
+            return null;
+        }
+
+        imagealphablending($canvas, true);
+        imagesavealpha($canvas, true);
+        $backgroundColor = imagecolorallocate($canvas, 15, 23, 42);
+        imagefill($canvas, 0, 0, $backgroundColor);
+
+        $minRegionX = intdiv((int) ($manifest['world_min_x'] ?? 0), 512);
+        $minRegionZ = intdiv((int) ($manifest['world_min_z'] ?? 0), 512);
+
+        foreach ($regions as $region) {
+            if (! is_array($region)) {
+                continue;
+            }
+
+            $file = (string) ($region['file'] ?? '');
+            if ($file === '') {
+                continue;
+            }
+
+            $regionImagePath = $this->sourceMapPath($file);
+            if (! $this->files->exists($regionImagePath)) {
+                continue;
+            }
+
+            $sourceImage = @imagecreatefrompng($regionImagePath);
+            if ($sourceImage === false) {
+                continue;
+            }
+
+            $regionPixelX = (((int) ($region['region_x'] ?? 0)) - $minRegionX) * 512;
+            $regionPixelY = (((int) ($region['region_z'] ?? 0)) - $minRegionZ) * 512;
+            $dstX = (int) floor($regionPixelX * $scale);
+            $dstY = (int) floor($regionPixelY * $scale);
+            $dstWidth = max(1, (int) floor(512 * $scale));
+            $dstHeight = max(1, (int) floor(512 * $scale));
+
+            imagecopyresampled(
+                $canvas,
+                $sourceImage,
+                $dstX,
+                $dstY,
+                0,
+                0,
+                $dstWidth,
+                $dstHeight,
+                max(1, imagesx($sourceImage)),
+                max(1, imagesy($sourceImage))
+            );
+
+            imagedestroy($sourceImage);
+        }
+
+        imagepng($canvas, $outputPath);
+        imagedestroy($canvas);
+
+        return [
+            'width' => $targetWidth,
+            'height' => $targetHeight,
+        ];
+    }
+
+    /**
+     * @return array{width:int,height:int}|null
+     */
+    private function buildSingleImageMinimap(
+        string $sourcePath,
+        string $outputPath,
+        int $sourceWidth,
+        int $sourceHeight
+    ): ?array {
+        $sourceImage = @imagecreatefrompng($sourcePath);
+        if ($sourceImage === false) {
+            return null;
+        }
+
+        $scale = min(
+            1.0,
+            self::MINIMAP_MAX_DIMENSION / max(1, max($sourceWidth, $sourceHeight))
+        );
+        $targetWidth = max(1, (int) floor($sourceWidth * $scale));
+        $targetHeight = max(1, (int) floor($sourceHeight * $scale));
+        $canvas = imagecreatetruecolor($targetWidth, $targetHeight);
+
+        if ($canvas === false) {
+            imagedestroy($sourceImage);
+
+            return null;
+        }
+
+        imagealphablending($canvas, true);
+        imagesavealpha($canvas, true);
+        imagecopyresampled(
+            $canvas,
+            $sourceImage,
+            0,
+            0,
+            0,
+            0,
+            $targetWidth,
+            $targetHeight,
+            max(1, imagesx($sourceImage)),
+            max(1, imagesy($sourceImage))
+        );
+        imagepng($canvas, $outputPath);
+        imagedestroy($canvas);
+        imagedestroy($sourceImage);
+
+        return [
+            'width' => $targetWidth,
+            'height' => $targetHeight,
+        ];
+    }
+
+    private function dispatchMinimapBuild(string $selectedRegion): void
+    {
+        $lockPath = $this->minimapDispatchLockPath($selectedRegion);
+        $now = time();
+        $lastDispatchedAt = $this->files->exists($lockPath)
+            ? (int) trim($this->files->get($lockPath))
+            : 0;
+
+        if (($now - $lastDispatchedAt) < self::MINIMAP_DISPATCH_COOLDOWN_SECONDS) {
+            return;
+        }
+
+        $this->safeEnsureDirectoryExists(dirname($lockPath));
+        $this->files->put($lockPath, (string) $now);
+        GenerateBirdsEyeMinimapJob::dispatch($selectedRegion === self::ALL_REGIONS ? null : $selectedRegion);
+    }
+
+    private function clearMinimapDispatchLock(string $selectedRegion): void
+    {
+        $lockPath = $this->minimapDispatchLockPath($selectedRegion);
+
+        if ($this->files->exists($lockPath)) {
+            $this->files->delete($lockPath);
+        }
+    }
+
+    private function minimapDispatchLockPath(string $selectedRegion): string
+    {
+        return storage_path(
+            'app'.DIRECTORY_SEPARATOR.'birds-eye-minimap'.DIRECTORY_SEPARATOR.$this->regionKey($selectedRegion).'.dispatch.lock'
+        );
     }
 
     private function safeEnsureDirectoryExists(string $path): void

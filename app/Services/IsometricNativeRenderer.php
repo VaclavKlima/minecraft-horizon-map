@@ -34,7 +34,7 @@ class IsometricNativeRenderer
             return null;
         }
 
-        $binaryPath = (string) config('render.isometric_native_binary', '');
+        $binaryPath = $this->resolveBinaryPath((string) config('render.isometric_native_binary', ''));
 
         if ($binaryPath === '' || ! $this->files->exists($binaryPath)) {
             return null;
@@ -225,5 +225,35 @@ class IsometricNativeRenderer
         imagedestroy($placeholder);
 
         return [$isoWidth, $isoHeight];
+    }
+
+    private function resolveBinaryPath(string $binaryPath): string
+    {
+        $trimmed = trim($binaryPath);
+
+        if ($trimmed === '') {
+            return '';
+        }
+
+        $normalized = str_replace(['/', '\\'], DIRECTORY_SEPARATOR, $trimmed);
+
+        if ($this->isAbsolutePath($normalized)) {
+            return $normalized;
+        }
+
+        return base_path($normalized);
+    }
+
+    private function isAbsolutePath(string $path): bool
+    {
+        if ($path === '') {
+            return false;
+        }
+
+        if (str_starts_with($path, DIRECTORY_SEPARATOR)) {
+            return true;
+        }
+
+        return preg_match('/^[A-Za-z]:\\\\/', $path) === 1;
     }
 }

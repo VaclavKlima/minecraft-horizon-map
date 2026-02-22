@@ -32,13 +32,6 @@
                             <option value="isometric">Isometric</option>
                         </select>
 
-                        <select
-                            id="region-select"
-                            class="rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-slate-100 focus:border-emerald-500 focus:outline-none"
-                        >
-                            <option value="all">All regions</option>
-                        </select>
-
                         <button
                             id="render-map"
                             type="button"
@@ -52,8 +45,9 @@
 
             <main class="relative overflow-hidden">
                 <div id="map-viewport" class="absolute inset-0 cursor-grab overflow-hidden bg-slate-950 active:cursor-grabbing">
+                    <canvas id="birds-eye-canvas" class="absolute inset-0"></canvas>
                     <canvas id="isometric-canvas" class="absolute inset-0 hidden"></canvas>
-                    <div id="tile-layer" class="absolute inset-0"></div>
+                    <div id="tile-layer" class="absolute inset-0 hidden"></div>
                 </div>
 
                 <aside class="pointer-events-none absolute left-4 top-4 z-20 w-72 rounded-lg border border-slate-700/80 bg-slate-900/85 p-3 text-xs">
@@ -83,6 +77,8 @@
         <script>
             const viewport = document.getElementById('map-viewport');
             const tileLayer = document.getElementById('tile-layer');
+            const birdsEyeCanvas = document.getElementById('birds-eye-canvas');
+            const birdsEyeContext = birdsEyeCanvas.getContext('2d', { alpha: true, desynchronized: true });
             const isometricCanvas = document.getElementById('isometric-canvas');
             const webglContext = isometricCanvas.getContext('webgl2', { alpha: true, antialias: false, premultipliedAlpha: true });
             const isometricContext = webglContext === null
@@ -98,7 +94,6 @@
             const renderMsEl = document.getElementById('map-render-ms');
             const pollCountEl = document.getElementById('map-poll-count');
             const renderButton = document.getElementById('render-map');
-            const regionSelect = document.getElementById('region-select');
             const projectionSelect = document.getElementById('projection-select');
             const overviewCanvas = document.getElementById('overview-map');
             const overviewStatusEl = document.getElementById('overview-status');
@@ -116,7 +111,6 @@
             let dragOriginX = 0;
             let dragOriginY = 0;
             let activeTiles = new Map();
-            let selectedRegion = null;
             let selectedProjection = 'birds-eye';
             let requestedViewState = null;
             let urlSyncTimeout = null;
@@ -124,10 +118,12 @@
             let batchPollTimer = null;
             let renderFrameRequested = false;
             let cursorFrameRequested = false;
+            let birdsEyeRetryTimer = null;
             let lastPointerClientX = 0;
             let lastPointerClientY = 0;
-            let renderedRegionOptionsKey = '';
             let pollCount = 0;
+            let birdsEyeCanvasWidth = 0;
+            let birdsEyeCanvasHeight = 0;
             let isometricCanvasWidth = 0;
             let isometricCanvasHeight = 0;
             let isometricCacheKey = '';
@@ -139,15 +135,14 @@
             let webglTextureUniform = null;
             let overviewMapState = null;
             let overviewDragging = false;
-            const overviewBirdsEyeTileCache = new Map();
             let overviewBaseCacheKey = '';
             let overviewBaseReady = false;
             let isometricOverviewLayerVersion = 0;
             let isometricOverviewPreloadTimer = null;
             let overviewRefreshPending = false;
-            let overviewIsometricImage = null;
-            let overviewIsometricImageUrl = '';
-            let overviewIsometricPendingUrl = '';
+            let overviewImage = null;
+            let overviewImageUrl = '';
+            let overviewImagePendingUrl = '';
             let isometricLayerLoaderWorker = null;
             let isometricLayerLoaderWorkerUrl = null;
             let isometricWorkerLoadFailures = 0;
@@ -164,6 +159,7 @@
             const maxTextureUploadsWhileDragging = 1;
             const workerFallbackDelayMs = 2200;
             const maxWorkerFailuresBeforeDisable = 3;
+            const birdsEyeTileRetryDelayMs = 1500;
             const usingWebglIsometric = webglContext !== null;
             const urlParams = new URLSearchParams(window.location.search);
 
@@ -346,11 +342,6 @@
                 selectedProjection = 'isometric';
             }
 
-            const requestedRegion = urlParams.get('region');
-            if (requestedRegion !== null && requestedRegion !== '') {
-                selectedRegion = requestedRegion;
-            }
-
             const requestedZoom = Number.parseInt(urlParams.get('zoom') ?? '', 10);
             const requestedOffsetX = Number.parseInt(urlParams.get('x') ?? '', 10);
             const requestedOffsetY = Number.parseInt(urlParams.get('y') ?? '', 10);
@@ -427,10 +418,6 @@
                 const params = new URLSearchParams();
                 params.set('projection', selectedProjection);
 
-                if (selectedRegion) {
-                    params.set('region', selectedRegion);
-                }
-
                 if (manifest) {
                     params.set('zoom', String(zoom));
                     params.set('x', String(Math.round(offsetX)));
@@ -478,13 +465,8 @@
                 statusEl.textContent = message;
             }
 
-            function buildQueryString(includeRegion = true) {
+            function buildQueryString() {
                 const params = new URLSearchParams();
-
-                if (includeRegion && selectedRegion) {
-                    params.set('region', selectedRegion);
-                }
-
                 params.set('projection', selectedProjection);
 
                 return params.toString();
@@ -495,7 +477,7 @@
             }
 
             function tileBasePath() {
-                const regionKey = regionKeyForPath(manifest?.selected_region ?? selectedRegion ?? 'all');
+                const regionKey = regionKeyForPath(manifest?.selected_region ?? 'all');
 
                 return `/maps/tiles/${regionKey}`;
             }
@@ -513,10 +495,6 @@
 
                 params.set('projection', selectedProjection);
 
-                if (selectedRegion) {
-                    params.set('region', selectedRegion);
-                }
-
                 return `/api/maps/tiles/${level}/${x}/${y}.png?${params.toString()}`;
             }
 
@@ -529,23 +507,36 @@
 
                 params.set('projection', selectedProjection);
 
-                if (selectedRegion) {
-                    params.set('region', selectedRegion);
-                }
-
                 return `/api/maps/tiles/${level}/${x}/${y}.png?${params.toString()}`;
             }
 
+            function urlWithRetryToken(url) {
+                const separator = url.includes('?') ? '&' : '?';
+
+                return `${url}${separator}retry=${Date.now()}`;
+            }
+
             function resetActiveTiles() {
-                activeTiles.forEach(tile => tile.remove());
+                if (birdsEyeRetryTimer !== null) {
+                    window.clearTimeout(birdsEyeRetryTimer);
+                    birdsEyeRetryTimer = null;
+                }
+
+                activeTiles.forEach(tile => {
+                    if (tile?.bitmap && typeof tile.bitmap.close === 'function') {
+                        tile.bitmap.close();
+                    }
+                });
                 activeTiles.clear();
+                clearBirdsEyeCanvas();
                 clearIsometricCanvas();
             }
 
             function syncProjectionLayers() {
                 const isometricMode = selectedProjection === 'isometric';
+                birdsEyeCanvas.classList.toggle('hidden', isometricMode);
                 isometricCanvas.classList.toggle('hidden', !isometricMode);
-                tileLayer.classList.toggle('hidden', isometricMode);
+                tileLayer.classList.add('hidden');
             }
 
             function initializeWebglRenderer() {
@@ -652,6 +643,41 @@
                 }
 
                 isometricContext.clearRect(0, 0, isometricCanvasWidth, isometricCanvasHeight);
+            }
+
+            function ensureBirdsEyeCanvasSize() {
+                if (birdsEyeContext === null) {
+                    return;
+                }
+
+                const viewportWidth = Math.max(1, viewport.clientWidth);
+                const viewportHeight = Math.max(1, viewport.clientHeight);
+                const ratio = Math.max(1, window.devicePixelRatio || 1);
+                const nextWidth = Math.max(1, Math.floor(viewportWidth * ratio));
+                const nextHeight = Math.max(1, Math.floor(viewportHeight * ratio));
+
+                if (birdsEyeCanvas.width !== nextWidth || birdsEyeCanvas.height !== nextHeight) {
+                    birdsEyeCanvas.width = nextWidth;
+                    birdsEyeCanvas.height = nextHeight;
+                }
+
+                birdsEyeCanvas.style.width = `${viewportWidth}px`;
+                birdsEyeCanvas.style.height = `${viewportHeight}px`;
+                birdsEyeCanvasWidth = viewportWidth;
+                birdsEyeCanvasHeight = viewportHeight;
+                birdsEyeContext.setTransform(ratio, 0, 0, ratio, 0, 0);
+            }
+
+            function clearBirdsEyeCanvas() {
+                if (birdsEyeContext === null) {
+                    return;
+                }
+
+                if (birdsEyeCanvasWidth <= 0 || birdsEyeCanvasHeight <= 0) {
+                    return;
+                }
+
+                birdsEyeContext.clearRect(0, 0, birdsEyeCanvasWidth, birdsEyeCanvasHeight);
             }
 
             function ensureIsometricCanvasSize() {
@@ -902,40 +928,48 @@
                 });
             }
 
-            function syncIsometricOverviewImage() {
-                if (selectedProjection !== 'isometric' || !manifest) {
+            function syncOverviewImage() {
+                if (!manifest) {
                     return;
                 }
 
                 const minimap = manifest.minimap ?? null;
                 const nextUrl = typeof minimap?.url === 'string' ? minimap.url : '';
 
+                if (nextUrl === '') {
+                    overviewImage = null;
+                    overviewImageUrl = '';
+                    overviewImagePendingUrl = '';
+                    return;
+                }
+
                 if (
-                    nextUrl === ''
-                    || nextUrl === overviewIsometricImageUrl
-                    || nextUrl === overviewIsometricPendingUrl
+                    nextUrl === overviewImageUrl
+                    || nextUrl === overviewImagePendingUrl
                 ) {
                     return;
                 }
 
-                overviewIsometricPendingUrl = nextUrl;
+                overviewImage = null;
+                overviewImageUrl = '';
+                overviewImagePendingUrl = nextUrl;
                 const image = new Image();
                 image.decoding = 'async';
                 image.loading = 'eager';
                 image.fetchPriority = 'high';
                 image.onload = () => {
-                    if (overviewIsometricPendingUrl !== nextUrl) {
+                    if (overviewImagePendingUrl !== nextUrl) {
                         return;
                     }
 
-                    overviewIsometricImage = image;
-                    overviewIsometricImageUrl = nextUrl;
-                    overviewIsometricPendingUrl = '';
+                    overviewImage = image;
+                    overviewImageUrl = nextUrl;
+                    overviewImagePendingUrl = '';
                     requestRenderTiles();
                 };
                 image.onerror = () => {
-                    if (overviewIsometricPendingUrl === nextUrl) {
-                        overviewIsometricPendingUrl = '';
+                    if (overviewImagePendingUrl === nextUrl) {
+                        overviewImagePendingUrl = '';
                     }
                 };
                 image.src = nextUrl;
@@ -1012,11 +1046,13 @@
                 const drawnHeight = sourceMapHeight * scale;
                 const originX = Math.floor((cssWidth - drawnWidth) / 2);
                 const originY = Math.floor((desiredHeight - drawnHeight) / 2);
-                const overviewKey = `${selectedProjection}:${selectedRegion ?? 'all'}:${manifest.generated_at ?? ''}:${cssWidth}:${desiredHeight}:${sourceMapWidth}:${sourceMapHeight}`;
+                const overviewKey = `${selectedProjection}:${manifest.generated_at ?? ''}:${cssWidth}:${desiredHeight}:${sourceMapWidth}:${sourceMapHeight}`;
 
-                if (selectedProjection === 'isometric') {
-                    syncIsometricOverviewImage();
-                    const minimap = manifest.minimap ?? null;
+                syncOverviewImage();
+                const minimap = manifest.minimap ?? null;
+                const hasMinimap = typeof minimap?.url === 'string' && minimap.url !== '';
+
+                if (hasMinimap) {
                     const minimapSourceWidth = Math.max(
                         1,
                         Number.parseInt(String(minimap?.source_width ?? sourceMapWidth), 10)
@@ -1036,9 +1072,9 @@
                     overviewContext.fillStyle = '#0f172a';
                     overviewContext.fillRect(minimapOriginX, minimapOriginY, minimapDrawnWidth, minimapDrawnHeight);
 
-                    if (overviewIsometricImage !== null) {
+                    if (overviewImage !== null) {
                         overviewContext.drawImage(
-                            overviewIsometricImage,
+                            overviewImage,
                             minimapOriginX,
                             minimapOriginY,
                             minimapDrawnWidth,
@@ -1059,10 +1095,16 @@
                     const sourceOffsetY = offsetY * divisor;
                     const sourceViewportWidth = viewport.clientWidth * divisor;
                     const sourceViewportHeight = viewport.clientHeight * divisor;
-                    const viewportRectX = minimapOriginX + (sourceOffsetX * minimapScale);
-                    const viewportRectY = minimapOriginY + (sourceOffsetY * minimapScale);
-                    const viewportRectWidth = Math.max(6, sourceViewportWidth * minimapScale);
-                    const viewportRectHeight = Math.max(6, sourceViewportHeight * minimapScale);
+                    const unclampedRectX = minimapOriginX + (sourceOffsetX * minimapScale);
+                    const unclampedRectY = minimapOriginY + (sourceOffsetY * minimapScale);
+                    const unclampedRectWidth = Math.max(6, sourceViewportWidth * minimapScale);
+                    const unclampedRectHeight = Math.max(6, sourceViewportHeight * minimapScale);
+                    const viewportRectX = Math.max(minimapOriginX, Math.min(minimapOriginX + minimapDrawnWidth, unclampedRectX));
+                    const viewportRectY = Math.max(minimapOriginY, Math.min(minimapOriginY + minimapDrawnHeight, unclampedRectY));
+                    const viewportRectMaxX = Math.max(viewportRectX, Math.min(minimapOriginX + minimapDrawnWidth, unclampedRectX + unclampedRectWidth));
+                    const viewportRectMaxY = Math.max(viewportRectY, Math.min(minimapOriginY + minimapDrawnHeight, unclampedRectY + unclampedRectHeight));
+                    const viewportRectWidth = Math.max(1, viewportRectMaxX - viewportRectX);
+                    const viewportRectHeight = Math.max(1, viewportRectMaxY - viewportRectY);
                     overviewContext.fillStyle = 'rgba(16, 185, 129, 0.18)';
                     overviewContext.fillRect(viewportRectX, viewportRectY, viewportRectWidth, viewportRectHeight);
                     overviewContext.strokeStyle = '#10b981';
@@ -1072,90 +1114,30 @@
                     overviewMapState = {
                         originX: minimapOriginX,
                         originY: minimapOriginY,
-                        scale: minimapScale,
+                        scaleX: minimapScale,
+                        scaleY: minimapScale,
                         mapWidth: minimapSourceWidth,
                         mapHeight: minimapSourceHeight,
-                        divisor,
+                        offsetScaleX: 1 / divisor,
+                        offsetScaleY: 1 / divisor,
                     };
                     overviewStatusEl.textContent = overviewBaseReady
                         ? `View ${Math.round(offsetX)},${Math.round(offsetY)} @ z${zoom}`
                         : 'Loading...';
                     return;
-                } else if (overviewBaseCacheKey !== overviewKey || !overviewBaseReady) {
+                }
+
+                if (overviewBaseCacheKey !== overviewKey || !overviewBaseReady) {
                     overviewBaseCanvas.width = cssWidth;
                     overviewBaseCanvas.height = desiredHeight;
                     overviewBaseContext.clearRect(0, 0, cssWidth, desiredHeight);
                     overviewBaseContext.imageSmoothingEnabled = false;
                     overviewBaseContext.fillStyle = '#0f172a';
                     overviewBaseContext.fillRect(originX, originY, drawnWidth, drawnHeight);
-                    let backgroundReady = false;
-
-                    {
-                        const minOverviewZoom = uiMinZoom();
-                        const minOverviewInfo = levelInfo(minOverviewZoom);
-
-                        if (minOverviewInfo && Number.isInteger(minOverviewInfo.tiles_x) && Number.isInteger(minOverviewInfo.tiles_y)) {
-                            const minOverviewDivisor = mapDivisor(minOverviewZoom);
-                            let drawnTileCount = 0;
-
-                            for (let tileY = 0; tileY < minOverviewInfo.tiles_y; tileY++) {
-                                for (let tileX = 0; tileX < minOverviewInfo.tiles_x; tileX++) {
-                                    const key = `${selectedProjection}:${selectedRegion ?? 'all'}:${manifest.generated_at ?? ''}:${minOverviewZoom}:${tileX}:${tileY}`;
-                                    let tileEntry = overviewBirdsEyeTileCache.get(key);
-
-                                    if (!tileEntry) {
-                                        const image = new Image();
-                                        image.decoding = 'async';
-                                        image.loading = 'eager';
-                                        image.fetchPriority = 'low';
-                                        tileEntry = { image, loaded: false, failed: false };
-                                        image.onload = () => {
-                                            tileEntry.loaded = true;
-                                            requestRenderTiles();
-                                        };
-                                        image.onerror = () => {
-                                            if (!image.dataset.apiFallback) {
-                                                image.dataset.apiFallback = '1';
-                                                image.src = apiTileUrl(minOverviewZoom, tileX, tileY);
-                                                return;
-                                            }
-
-                                            tileEntry.failed = true;
-                                        };
-                                        image.src = tileUrl(minOverviewZoom, tileX, tileY);
-                                        overviewBirdsEyeTileCache.set(key, tileEntry);
-                                    }
-
-                                    if (!tileEntry.loaded || tileEntry.failed) {
-                                        continue;
-                                    }
-
-                                    const sourcePixelX = tileX * tileSize * minOverviewDivisor;
-                                    const sourcePixelY = tileY * tileSize * minOverviewDivisor;
-                                    const tilePixelWidth = Math.min(tileSize, Math.max(0, minOverviewInfo.width - (tileX * tileSize)));
-                                    const tilePixelHeight = Math.min(tileSize, Math.max(0, minOverviewInfo.height - (tileY * tileSize)));
-                                    const sourcePixelWidth = tilePixelWidth * minOverviewDivisor;
-                                    const sourcePixelHeight = tilePixelHeight * minOverviewDivisor;
-                                    const targetX = originX + ((sourcePixelX / sourceMapWidth) * drawnWidth);
-                                    const targetY = originY + ((sourcePixelY / sourceMapHeight) * drawnHeight);
-                                    const targetWidth = Math.max(1, (sourcePixelWidth / sourceMapWidth) * drawnWidth);
-                                    const targetHeight = Math.max(1, (sourcePixelHeight / sourceMapHeight) * drawnHeight);
-                                    overviewBaseContext.drawImage(tileEntry.image, targetX, targetY, targetWidth, targetHeight);
-                                    drawnTileCount++;
-                                }
-                            }
-
-                            backgroundReady = drawnTileCount > 0;
-                        }
-                    }
-
-                    if (!backgroundReady) {
-                        overviewBaseContext.fillStyle = '#111827';
-                        overviewBaseContext.fillRect(originX, originY, drawnWidth, drawnHeight);
-                    }
-
+                    overviewBaseContext.fillStyle = '#111827';
+                    overviewBaseContext.fillRect(originX, originY, drawnWidth, drawnHeight);
                     overviewBaseCacheKey = overviewKey;
-                    overviewBaseReady = backgroundReady;
+                    overviewBaseReady = false;
                 }
 
                 overviewContext.clearRect(0, 0, cssWidth, desiredHeight);
@@ -1164,14 +1146,12 @@
                 overviewContext.lineWidth = 1;
                 overviewContext.strokeRect(originX + 0.5, originY + 0.5, Math.max(0, drawnWidth - 1), Math.max(0, drawnHeight - 1));
 
-                const sourceOffsetX = offsetX * divisor;
-                const sourceOffsetY = offsetY * divisor;
-                const sourceViewportWidth = viewport.clientWidth * divisor;
-                const sourceViewportHeight = viewport.clientHeight * divisor;
-                const viewportRectX = originX + (sourceOffsetX * scale);
-                const viewportRectY = originY + (sourceOffsetY * scale);
-                const viewportRectWidth = Math.max(6, sourceViewportWidth * scale);
-                const viewportRectHeight = Math.max(6, sourceViewportHeight * scale);
+                const overviewScaleX = drawnWidth / Math.max(1, info.width);
+                const overviewScaleY = drawnHeight / Math.max(1, info.height);
+                const viewportRectX = originX + (offsetX * overviewScaleX);
+                const viewportRectY = originY + (offsetY * overviewScaleY);
+                const viewportRectWidth = Math.max(6, viewport.clientWidth * overviewScaleX);
+                const viewportRectHeight = Math.max(6, viewport.clientHeight * overviewScaleY);
 
                 overviewContext.fillStyle = 'rgba(16, 185, 129, 0.18)';
                 overviewContext.fillRect(viewportRectX, viewportRectY, viewportRectWidth, viewportRectHeight);
@@ -1182,10 +1162,12 @@
                 overviewMapState = {
                     originX,
                     originY,
-                    scale,
-                    mapWidth: sourceMapWidth,
-                    mapHeight: sourceMapHeight,
-                    divisor,
+                    scaleX: overviewScaleX,
+                    scaleY: overviewScaleY,
+                    mapWidth: info.width,
+                    mapHeight: info.height,
+                    offsetScaleX: 1,
+                    offsetScaleY: 1,
                 };
                 overviewStatusEl.textContent = overviewBaseReady
                     ? `View ${Math.round(offsetX)},${Math.round(offsetY)} @ z${zoom}`
@@ -1202,16 +1184,16 @@
                 const localY = clientY - rect.top;
                 const clampedX = Math.max(
                     overviewMapState.originX,
-                    Math.min(overviewMapState.originX + (overviewMapState.mapWidth * overviewMapState.scale), localX)
+                    Math.min(overviewMapState.originX + (overviewMapState.mapWidth * overviewMapState.scaleX), localX)
                 );
                 const clampedY = Math.max(
                     overviewMapState.originY,
-                    Math.min(overviewMapState.originY + (overviewMapState.mapHeight * overviewMapState.scale), localY)
+                    Math.min(overviewMapState.originY + (overviewMapState.mapHeight * overviewMapState.scaleY), localY)
                 );
-                const mapX = (clampedX - overviewMapState.originX) / overviewMapState.scale;
-                const mapY = (clampedY - overviewMapState.originY) / overviewMapState.scale;
-                offsetX = Math.round((mapX / overviewMapState.divisor) - (viewport.clientWidth / 2));
-                offsetY = Math.round((mapY / overviewMapState.divisor) - (viewport.clientHeight / 2));
+                const mapX = (clampedX - overviewMapState.originX) / overviewMapState.scaleX;
+                const mapY = (clampedY - overviewMapState.originY) / overviewMapState.scaleY;
+                offsetX = Math.round((mapX * overviewMapState.offsetScaleX) - (viewport.clientWidth / 2));
+                offsetY = Math.round((mapY * overviewMapState.offsetScaleY) - (viewport.clientHeight / 2));
                 clampOffsets();
                 requestRenderTiles();
             }
@@ -1460,6 +1442,17 @@
                 const maxTileY = Math.min(renderInfo.tiles_y - 1, visibleMaxTileY + preloadTileMargin);
                 const nextKeys = new Set();
                 let visibleTileCount = 0;
+                let drawnTileCount = 0;
+                let pendingTileCount = 0;
+                const renderNow = performance.now();
+                let nextRetryAt = null;
+
+                ensureBirdsEyeCanvasSize();
+                clearBirdsEyeCanvas();
+
+                if (birdsEyeContext !== null) {
+                    birdsEyeContext.imageSmoothingEnabled = false;
+                }
 
                 for (let tileY = minTileY; tileY <= maxTileY; tileY++) {
                     for (let tileX = minTileX; tileX <= maxTileX; tileX++) {
@@ -1471,79 +1464,123 @@
                         nextKeys.add(key);
 
                         if (!activeTiles.has(key)) {
-                            const img = new Image();
-                            img.draggable = false;
-                            img.src = tileUrl(renderZoom, tileX, tileY);
-                            img.decoding = 'async';
-                            img.loading = isVisible ? 'eager' : 'lazy';
-                            img.fetchPriority = isVisible ? 'high' : 'low';
-                            img.onerror = () => {
-                                if (!img.dataset.apiFallback) {
-                                    img.dataset.apiFallback = '1';
-                                    img.src = apiTileUrl(renderZoom, tileX, tileY);
-
+                            const image = new Image();
+                            image.draggable = false;
+                            image.decoding = 'async';
+                            image.loading = isVisible ? 'eager' : 'lazy';
+                            image.fetchPriority = isVisible ? 'high' : 'low';
+                            const entry = {
+                                image,
+                                bitmap: null,
+                                loaded: false,
+                                failed: false,
+                                loading: true,
+                                usingApiFallback: false,
+                                retryAt: 0,
+                            };
+                            image.onload = async () => {
+                                entry.loading = false;
+                                entry.failed = false;
+                                entry.loaded = true;
+                                entry.retryAt = 0;
+                                if (typeof createImageBitmap === 'function') {
+                                    try {
+                                        entry.bitmap = await createImageBitmap(image);
+                                    } catch {
+                                        entry.bitmap = null;
+                                    }
+                                }
+                                requestRenderTiles();
+                            };
+                            image.onerror = () => {
+                                if (!entry.usingApiFallback) {
+                                    entry.usingApiFallback = true;
+                                    image.src = urlWithRetryToken(apiTileUrl(renderZoom, tileX, tileY));
                                     return;
                                 }
+
+                                entry.loading = false;
+                                entry.failed = true;
+                                entry.retryAt = performance.now() + birdsEyeTileRetryDelayMs;
+                                requestRenderTiles();
                             };
-                            img.className = 'absolute h-64 w-64 select-none';
-                            activeTiles.set(key, img);
-                            tileLayer.appendChild(img);
+                            image.src = tileUrl(renderZoom, tileX, tileY);
+                            activeTiles.set(key, entry);
                         }
 
-                        const tile = activeTiles.get(key);
-                        tile.loading = isVisible ? 'eager' : 'lazy';
-                        tile.fetchPriority = isVisible ? 'high' : 'low';
-                        tile.style.left = `${(tileX * scaledTileSize) - offsetX}px`;
-                        tile.style.top = `${(tileY * scaledTileSize) - offsetY}px`;
-                        tile.style.width = `${scaledTileSize}px`;
-                        tile.style.height = `${scaledTileSize}px`;
+                        const tileEntry = activeTiles.get(key);
+                        tileEntry.image.loading = isVisible ? 'eager' : 'lazy';
+                        tileEntry.image.fetchPriority = isVisible ? 'high' : 'low';
 
                         if (isVisible) {
                             visibleTileCount++;
+                            if (tileEntry.failed && !tileEntry.loading && renderNow >= tileEntry.retryAt) {
+                                tileEntry.failed = false;
+                                tileEntry.loaded = false;
+                                tileEntry.loading = true;
+                                tileEntry.usingApiFallback = false;
+                                tileEntry.retryAt = 0;
+                                if (tileEntry.bitmap && typeof tileEntry.bitmap.close === 'function') {
+                                    tileEntry.bitmap.close();
+                                }
+                                tileEntry.bitmap = null;
+                                tileEntry.image.src = urlWithRetryToken(tileUrl(renderZoom, tileX, tileY));
+                                pendingTileCount++;
+                                continue;
+                            }
+
+                            if (tileEntry.failed && !tileEntry.loading && nextRetryAt === null) {
+                                nextRetryAt = tileEntry.retryAt;
+                            } else if (tileEntry.failed && !tileEntry.loading && tileEntry.retryAt < nextRetryAt) {
+                                nextRetryAt = tileEntry.retryAt;
+                            }
+
+                            if (tileEntry.loaded && !tileEntry.failed && birdsEyeContext !== null) {
+                                const drawX = (tileX * scaledTileSize) - offsetX;
+                                const drawY = (tileY * scaledTileSize) - offsetY;
+                                const drawSource = tileEntry.bitmap ?? tileEntry.image;
+                                birdsEyeContext.drawImage(drawSource, drawX, drawY, scaledTileSize, scaledTileSize);
+                                drawnTileCount++;
+                            } else if (!tileEntry.failed) {
+                                pendingTileCount++;
+                            }
                         }
                     }
                 }
 
-                for (const [key, tile] of activeTiles.entries()) {
+                for (const [key, tileEntry] of activeTiles.entries()) {
                     if (!nextKeys.has(key)) {
-                        tile.remove();
+                        if (tileEntry?.bitmap && typeof tileEntry.bitmap.close === 'function') {
+                            tileEntry.bitmap.close();
+                        }
                         activeTiles.delete(key);
                     }
                 }
 
                 zoomEl.textContent = `${zoom} / ${uiMaxZoom()} (src: ${renderZoom})`;
                 tilesEl.textContent = `${info.tiles_x} x ${info.tiles_y}`;
-                visibleTilesEl.textContent = String(visibleTileCount);
+                visibleTilesEl.textContent = `${drawnTileCount}/${visibleTileCount}`;
                 renderMsEl.textContent = `${Math.round(performance.now() - renderStartedAt)}`;
                 renderOverviewMap();
                 scheduleUrlStateSync();
-            }
 
-            function renderRegionOptions() {
-                const regions = manifest?.available_regions ?? [];
-                const optionsKey = regions.join('|');
-
-                if (optionsKey === renderedRegionOptionsKey) {
-                    regionSelect.value = selectedRegion ?? 'all';
-                    regionSelect.disabled = regions.length === 0;
-
+                if (pendingTileCount > 0) {
+                    requestRenderTiles();
                     return;
                 }
 
-                renderedRegionOptionsKey = optionsKey;
-                regionSelect.innerHTML = '';
-                const fragment = document.createDocumentFragment();
+                if (nextRetryAt !== null) {
+                    const retryDelay = Math.max(40, Math.ceil(nextRetryAt - renderNow));
 
-                for (const region of regions) {
-                    const option = document.createElement('option');
-                    option.value = region;
-                    option.textContent = region === 'all' ? 'All regions' : region;
-                    option.selected = region === selectedRegion;
-                    fragment.appendChild(option);
+                    if (birdsEyeRetryTimer !== null) {
+                        window.clearTimeout(birdsEyeRetryTimer);
+                    }
+
+                    birdsEyeRetryTimer = window.setTimeout(() => {
+                        birdsEyeRetryTimer = null;
+                        requestRenderTiles();
+                    }, retryDelay);
                 }
-
-                regionSelect.appendChild(fragment);
-                regionSelect.disabled = regions.length === 0;
             }
 
             function fitInitialPosition() {
@@ -1595,27 +1632,19 @@
                 requestRenderTiles();
             }
 
-            async function loadManifest(region = selectedRegion, options = {}) {
+            async function loadManifest(options = {}) {
                 const manifestStartedAt = performance.now();
                 const preserveView = options.preserveView === true;
-                const includeRegions = options.includeRegions !== false;
                 const refresh = options.refresh !== false;
                 setStatus('Loading map manifest...');
-                selectedRegion = region || null;
                 const hadManifest = manifest !== null;
-                const query = buildQueryString(true);
-                const response = await fetch(`/api/maps/manifest?${query}&include_regions=${includeRegions ? '1' : '0'}&refresh=${refresh ? '1' : '0'}`);
+                const query = buildQueryString();
+                const response = await fetch(`/api/maps/manifest?${query}&include_regions=0&refresh=${refresh ? '1' : '0'}`);
                 const payload = await response.json();
 
                 if (!payload.available) {
                     manifest = null;
-                    selectedRegion = null;
                     stopIsometricOverviewPreload();
-                    if (includeRegions) {
-                        regionSelect.innerHTML = '<option value="">No regions</option>';
-                        regionSelect.disabled = true;
-                        renderedRegionOptionsKey = '';
-                    }
                     resetActiveTiles();
                     setStatus(payload.message ?? 'Map not available.');
                     manifestMsEl.textContent = `${Math.round(performance.now() - manifestStartedAt)}`;
@@ -1624,31 +1653,19 @@
                 }
 
                 manifest = payload.manifest;
-                selectedRegion = manifest.selected_region;
-                const activeOverviewPrefix = `${selectedProjection}:${selectedRegion ?? 'all'}:${manifest.generated_at ?? ''}:`;
-                for (const cacheKey of overviewBirdsEyeTileCache.keys()) {
-                    if (!cacheKey.startsWith(activeOverviewPrefix)) {
-                        overviewBirdsEyeTileCache.delete(cacheKey);
-                    }
-                }
                 overviewBaseCacheKey = '';
                 overviewBaseReady = false;
                 syncProjectionLayers();
-                const nextCacheKey = `${selectedProjection}:${selectedRegion}:${manifest.generated_at ?? ''}`;
+                const nextCacheKey = `${selectedProjection}:${manifest.generated_at ?? ''}`;
                 if (selectedProjection === 'isometric' && isometricCacheKey !== nextCacheKey) {
                     isometricCacheKey = nextCacheKey;
                     isometricOverviewLayerVersion = 0;
                     syncIsometricLayerCache();
                     scheduleIsometricOverviewPreload();
-                    syncIsometricOverviewImage();
                 } else if (selectedProjection !== 'isometric') {
                     stopIsometricOverviewPreload();
-                } else {
-                    syncIsometricOverviewImage();
                 }
-                if (includeRegions) {
-                    renderRegionOptions();
-                }
+                syncOverviewImage();
                 if (preserveView && hadManifest) {
                     zoom = Math.min(zoom, uiMaxZoom());
                     clampOffsets();
@@ -1658,7 +1675,7 @@
 
                 resetActiveTiles();
                 requestRenderTiles();
-                setStatus(`Map loaded (${selectedProjection}, ${selectedRegion}): ${manifest.source_width} x ${manifest.source_height} blocks`);
+                setStatus(`Map loaded (${selectedProjection}, full): ${manifest.source_width} x ${manifest.source_height} blocks`);
                 manifestMsEl.textContent = `${Math.round(performance.now() - manifestStartedAt)}`;
                 scheduleUrlStateSync();
             }
@@ -1684,13 +1701,12 @@
                         pollIteration++;
                         pollCount++;
                         pollCountEl.textContent = String(pollCount);
-                        const shouldRefreshManifest = selectedProjection === 'isometric' && selectedRegion === 'all'
+                        const shouldRefreshManifest = selectedProjection === 'isometric'
                             ? pollIteration % 2 === 0
                             : pollIteration % 4 === 0;
                         if (payload.finished === true || shouldRefreshManifest) {
-                            await loadManifest(selectedRegion, {
+                            await loadManifest({
                                 preserveView: true,
-                                includeRegions: false,
                                 refresh: shouldRefreshManifest || payload.finished === true,
                             });
                         }
@@ -1752,9 +1768,8 @@
 
                     if (queuedRegions === 0 || batchId === '') {
                         setStatus(payload.message ?? 'No changed regions detected.');
-                        await loadManifest(selectedRegion, {
+                        await loadManifest({
                             preserveView: true,
-                            includeRegions: false,
                             refresh: true,
                         });
 
@@ -1844,27 +1859,14 @@
             });
 
             renderButton.addEventListener('click', renderWorldMap);
-            regionSelect.addEventListener('change', () => {
-                selectedRegion = regionSelect.value || null;
-                resetActiveTiles();
-                scheduleUrlStateSync();
-                loadManifest(selectedRegion, {
-                    preserveView: false,
-                    includeRegions: true,
-                    refresh: true,
-                }).catch(error => setStatus(error.message));
-            });
-
             projectionSelect.addEventListener('change', () => {
                 stopBatchPolling();
                 selectedProjection = projectionSelect.value || 'birds-eye';
-                selectedRegion = null;
                 resetActiveTiles();
                 syncProjectionLayers();
                 scheduleUrlStateSync();
-                loadManifest(null, {
+                loadManifest({
                     preserveView: false,
-                    includeRegions: true,
                     refresh: true,
                 }).catch(error => setStatus(error.message));
             });
@@ -1883,9 +1885,8 @@
                 }
             });
 
-            loadManifest(null, {
+            loadManifest({
                 preserveView: false,
-                includeRegions: true,
                 refresh: true,
             }).catch(error => setStatus(error.message));
             syncProjectionLayers();

@@ -115,10 +115,13 @@ fn apply_brightness(channel: u8, factor: f64) -> u8 {
     (channel as f64 * factor).round().clamp(0.0, 255.0) as u8
 }
 
+fn clamp_height(height: i32) -> i32 {
+    height.clamp(HEIGHT_BASELINE, HEIGHT_CEILING)
+}
+
 fn apply_height_shading(red: u8, green: u8, blue: u8, world_y: i32) -> (u8, u8, u8) {
-    let normalized_height = (world_y.clamp(HEIGHT_BASELINE, HEIGHT_CEILING) - HEIGHT_BASELINE)
-        as f64
-        / (HEIGHT_CEILING - HEIGHT_BASELINE) as f64;
+    let normalized_height =
+        (clamp_height(world_y) - HEIGHT_BASELINE) as f64 / (HEIGHT_CEILING - HEIGHT_BASELINE) as f64;
     let mut brightness_factor = 0.86 + (normalized_height * 0.28);
 
     // Subtle terrace cue every 8 levels to make vertical differences easier to read.
@@ -539,6 +542,123 @@ fn compute_fluid_depths(
     fluid_depths
 }
 
+fn render_birds_eye(
+    output_path: &str,
+    source_width: usize,
+    source_height: usize,
+    min_y: i32,
+    height_span: usize,
+    occupancy: &[u8],
+    colors: &[u8],
+    water_mask: &[u8],
+    lava_mask: &[u8],
+    water_depths: &[u16],
+    lava_depths: &[u16],
+) -> Result<(i32, i32), String> {
+    let total_columns = source_width * source_height;
+    let mut rgba = vec![0u8; total_columns * 4];
+    let mut top_heights = vec![0i32; total_columns];
+    let mut top_colors = vec![(0u8, 0u8, 0u8); total_columns];
+    let mut top_exists = vec![false; total_columns];
+    let mut min_surface_height: Option<i32> = None;
+    let mut max_surface_height: Option<i32> = None;
+
+    for column_index in 0..total_columns {
+        let column_voxel_base_index = column_index * height_span;
+        let mut top_y_offset: Option<usize> = None;
+
+        for y_offset in (0..height_span).rev() {
+            let voxel_index = column_voxel_base_index + y_offset;
+
+            if is_voxel_solid(occupancy, voxel_index) {
+                top_y_offset = Some(y_offset);
+                break;
+            }
+        }
+
+        let Some(y_offset) = top_y_offset else {
+            continue;
+        };
+
+        let voxel_index = column_voxel_base_index + y_offset;
+        let world_y = min_y + y_offset as i32;
+        let (top_red, top_green, top_blue) = color_at(colors, voxel_index);
+        let (top_red, top_green, top_blue) =
+            apply_height_shading(top_red, top_green, top_blue, world_y);
+        let (top_red, top_green, top_blue) = if water_mask[voxel_index] == 1 {
+            apply_water_depth_shading(
+                top_red,
+                top_green,
+                top_blue,
+                water_depths[voxel_index],
+            )
+        } else if lava_mask[voxel_index] == 1 {
+            apply_lava_depth_shading(top_red, top_green, top_blue, lava_depths[voxel_index])
+        } else {
+            (top_red, top_green, top_blue)
+        };
+
+        top_heights[column_index] = world_y;
+        top_colors[column_index] = (top_red, top_green, top_blue);
+        top_exists[column_index] = true;
+        min_surface_height = Some(min_surface_height.map_or(world_y, |value| value.min(world_y)));
+        max_surface_height = Some(max_surface_height.map_or(world_y, |value| value.max(world_y)));
+    }
+
+    for column_index in 0..total_columns {
+        if !top_exists[column_index] {
+            continue;
+        }
+
+        let world_x = column_index % source_width;
+        let world_z = column_index / source_width;
+        let height = top_heights[column_index];
+        let east_height = if world_x + 1 < source_width {
+            let east_index = column_index + 1;
+
+            if top_exists[east_index] {
+                top_heights[east_index]
+            } else {
+                height
+            }
+        } else {
+            height
+        };
+        let south_height = if world_z + 1 < source_height {
+            let south_index = column_index + source_width;
+
+            if top_exists[south_index] {
+                top_heights[south_index]
+            } else {
+                height
+            }
+        } else {
+            height
+        };
+        let slope = ((height - east_height) + (height - south_height)) as f64 / 2.0;
+        let normalized =
+            (clamp_height(height) - HEIGHT_BASELINE) as f64 / (HEIGHT_CEILING - HEIGHT_BASELINE) as f64;
+        let height_boost = 0.9 + (normalized * 0.25);
+        let shade_factor = ((1.0 + (slope / 14.0)) * height_boost).clamp(0.65, 1.25);
+        let (red, green, blue) = top_colors[column_index];
+        let shaded_red = apply_brightness(red, shade_factor);
+        let shaded_green = apply_brightness(green, shade_factor);
+        let shaded_blue = apply_brightness(blue, shade_factor);
+        let rgba_offset = column_index * 4;
+        rgba[rgba_offset] = shaded_red;
+        rgba[rgba_offset + 1] = shaded_green;
+        rgba[rgba_offset + 2] = shaded_blue;
+        rgba[rgba_offset + 3] = 255;
+    }
+
+    write_png(output_path, source_width, source_height, &rgba)?;
+
+    Ok((
+        min_surface_height.unwrap_or(min_y),
+        max_surface_height.unwrap_or(min_y),
+    ))
+}
+
 fn log_missing_palette_color(
     logged_missing_palette_colors: &mut HashSet<(i32, i32, i32, usize)>,
     chunk_x: i32,
@@ -612,6 +732,16 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    let projection = args
+        .get("--projection")
+        .cloned()
+        .unwrap_or_else(|| "isometric".to_string());
+
+    if projection != "isometric" && projection != "birds-eye" {
+        eprintln!("invalid value for --projection: {projection}");
+
+        return ExitCode::from(2);
+    }
 
     let input_raw = match fs::read(sections_path) {
         Ok(value) => value,
@@ -862,6 +992,43 @@ fn main() -> ExitCode {
         height_span,
         total_voxels,
     );
+
+    if projection == "birds-eye" {
+        let (min_surface_height, max_surface_height) = match render_birds_eye(
+            &output_path,
+            source_width,
+            source_height,
+            min_y,
+            height_span,
+            &occupancy,
+            &colors,
+            &water_mask,
+            &lava_mask,
+            &water_depths,
+            &lava_depths,
+        ) {
+            Ok(metrics) => metrics,
+            Err(error) => {
+                eprintln!("{error}");
+
+                return ExitCode::from(1);
+            }
+        };
+
+        if !logged_missing_palette_colors.is_empty() {
+            eprintln!(
+                "encountered {} unique missing palette color entries",
+                logged_missing_palette_colors.len()
+            );
+        }
+
+        println!(
+            "{{\"width\":{},\"height\":{},\"min_height\":{},\"max_height\":{}}}",
+            source_width, source_height, min_surface_height, max_surface_height
+        );
+
+        return ExitCode::SUCCESS;
+    }
 
     let mut runs: Vec<RunsEntry> = Vec::new();
     for column_index in 0..total_columns {

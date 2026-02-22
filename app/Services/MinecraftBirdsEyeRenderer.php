@@ -8,7 +8,7 @@ use RuntimeException;
 
 class MinecraftBirdsEyeRenderer
 {
-    private const RENDER_METADATA_VERSION = 7;
+    private const RENDER_METADATA_VERSION = 8;
 
     private const HEIGHT_BASELINE = -128;
 
@@ -26,7 +26,11 @@ class MinecraftBirdsEyeRenderer
      */
     private ?array $configuredBlockPalette = null;
 
-    public function __construct(private Filesystem $files, private MinecraftRegionReader $minecraftRegionReader) {}
+    public function __construct(
+        private Filesystem $files,
+        private MinecraftRegionReader $minecraftRegionReader,
+        private BirdsEyeNativeRenderer $birdsEyeNativeRenderer
+    ) {}
 
     /**
      * @return array{
@@ -97,14 +101,39 @@ class MinecraftBirdsEyeRenderer
      */
     public function renderRegion(string $regionFile, string $heightmapType = 'WORLD_SURFACE'): ?array
     {
+        $profileEnabled = (bool) config('render.birds_eye_profile_enabled', false);
+        $renderStartedAt = microtime(true);
         $regionPath = public_path('region'.DIRECTORY_SEPARATOR.$regionFile);
 
         if (! $this->files->exists($regionPath)) {
             throw new RuntimeException("Region file not found: {$regionFile}");
         }
 
-        $binary = $this->files->get($regionPath);
-        $rendered = $this->renderSingleRegion($regionFile, $binary, $heightmapType);
+        $nativeStartedAt = microtime(true);
+        $rendered = $this->renderRegionWithNative($regionFile, $heightmapType);
+        $nativeElapsedMs = (int) round((microtime(true) - $nativeStartedAt) * 1000);
+
+        if ($rendered === null) {
+            $phpStartedAt = microtime(true);
+            $binary = $this->files->get($regionPath);
+            $rendered = $this->renderSingleRegion($regionFile, $binary, $heightmapType);
+            $phpElapsedMs = (int) round((microtime(true) - $phpStartedAt) * 1000);
+
+            if ($profileEnabled) {
+                Log::info('Birds-eye region render timings (php fallback).', [
+                    'region_file' => $regionFile,
+                    'native_attempt_ms' => $nativeElapsedMs,
+                    'php_render_ms' => $phpElapsedMs,
+                    'total_ms' => (int) round((microtime(true) - $renderStartedAt) * 1000),
+                ]);
+            }
+        } elseif ($profileEnabled) {
+            Log::info('Birds-eye region render timings (native).', [
+                'region_file' => $regionFile,
+                'native_render_ms' => $nativeElapsedMs,
+                'total_ms' => (int) round((microtime(true) - $renderStartedAt) * 1000),
+            ]);
+        }
 
         if ($rendered === null) {
             return null;
@@ -295,6 +324,7 @@ class MinecraftBirdsEyeRenderer
 
     public function regionNeedsRendering(string $regionFile, string $heightmapType = 'WORLD_SURFACE'): bool
     {
+        $nativeEnabled = (bool) config('render.birds_eye_native_enabled', false);
         $regionPath = public_path('region'.DIRECTORY_SEPARATOR.$regionFile);
         $renderPath = public_path('maps/regions'.DIRECTORY_SEPARATOR.str_replace('.mca', '.png', $regionFile));
         $metadataPath = $this->renderMetadataPath($regionFile);
@@ -304,15 +334,20 @@ class MinecraftBirdsEyeRenderer
         $underlayHeightMapPath = $this->regionUnderlayHeightMapPath($regionFile);
         $underlayColorMapPath = $this->regionUnderlayColorMapPath($regionFile);
 
-        if (
-            ! $this->files->exists($regionPath)
-            || ! $this->files->exists($renderPath)
-            || ! $this->files->exists($metadataPath)
-            || ! $this->files->exists($heightMapPath)
+        if (! $nativeEnabled && (
+            ! $this->files->exists($heightMapPath)
             || ! $this->files->exists($surfaceMapPath)
             || ! $this->files->exists($voxelMapPath)
             || ! $this->files->exists($underlayHeightMapPath)
             || ! $this->files->exists($underlayColorMapPath)
+        )) {
+            return true;
+        }
+
+        if (
+            ! $this->files->exists($regionPath)
+            || ! $this->files->exists($renderPath)
+            || ! $this->files->exists($metadataPath)
         ) {
             return true;
         }
@@ -327,6 +362,123 @@ class MinecraftBirdsEyeRenderer
         return ($metadata['version'] ?? null) !== self::RENDER_METADATA_VERSION
             || ($metadata['heightmap_type'] ?? null) !== $heightmapType
             || ($metadata['source_modified_at'] ?? null) !== $this->files->lastModified($regionPath);
+    }
+
+    /**
+     * @return array{
+     *     region_file:string,
+     *     file:string,
+     *     relative_path:string,
+     *     width_blocks:int,
+     *     height_blocks:int,
+     *     min_height:float,
+     *     max_height:float,
+     *     chunk_count:int
+     * }|null
+     */
+    private function renderRegionWithNative(string $regionFile, string $heightmapType): ?array
+    {
+        $sourceWidth = 32 * 16;
+        $sourceHeight = 32 * 16;
+        $tempDir = storage_path('app'.DIRECTORY_SEPARATOR.'birdseye-native'.DIRECTORY_SEPARATOR.uniqid('run_', true));
+        $this->files->ensureDirectoryExists($tempDir);
+        $sectionsPath = $tempDir.DIRECTORY_SEPARATOR.'sections.json';
+        $chunkCount = $this->writeNativeSectionsSnapshot($regionFile, $sectionsPath, $sourceWidth, $sourceHeight);
+
+        if ($chunkCount === 0) {
+            $this->files->deleteDirectory($tempDir);
+
+            return null;
+        }
+
+        try {
+            return $this->birdsEyeNativeRenderer->renderFromSectionsSnapshot(
+                $regionFile,
+                $heightmapType,
+                $sectionsPath,
+                $chunkCount,
+                $sourceWidth,
+                $sourceHeight
+            );
+        } finally {
+            $this->files->deleteDirectory($tempDir);
+        }
+    }
+
+    private function writeNativeSectionsSnapshot(
+        string $regionFile,
+        string $sectionsPath,
+        int $sourceWidth,
+        int $sourceHeight
+    ): int {
+        $handle = fopen($sectionsPath, 'wb');
+
+        if ($handle === false) {
+            throw new RuntimeException('Unable to open temporary native sections snapshot for writing.');
+        }
+
+        try {
+            fwrite($handle, '{"source_width":'.$sourceWidth.',"source_height":'.$sourceHeight.',"chunks":[');
+
+            $isFirstChunk = true;
+            $chunkCount = $this->iterateRegionSections(
+                $regionFile,
+                function (int $chunkX, int $chunkZ, array $chunkSections) use (&$isFirstChunk, $handle): void {
+                    $chunkPayload = [
+                        'chunk_x' => $chunkX,
+                        'chunk_z' => $chunkZ,
+                        'sections' => $this->normalizeChunkSectionsForNative($chunkSections),
+                    ];
+
+                    if (! $isFirstChunk) {
+                        fwrite($handle, ',');
+                    }
+
+                    fwrite($handle, json_encode($chunkPayload, JSON_THROW_ON_ERROR));
+                    $isFirstChunk = false;
+                }
+            );
+
+            fwrite($handle, ']}');
+        } finally {
+            fclose($handle);
+        }
+
+        return $chunkCount;
+    }
+
+    /**
+     * @param  array<int, array<string, mixed>>  $chunkSections
+     * @return array<int, array<string, mixed>>
+     */
+    private function normalizeChunkSectionsForNative(array $chunkSections): array
+    {
+        $normalizedSections = [];
+
+        foreach ($chunkSections as $sectionY => $section) {
+            $normalizedSections[] = [
+                'section_y' => (int) $sectionY,
+                'palette_is_air' => $section['palette_is_air'],
+                'palette_is_water' => $section['palette_is_water'],
+                'palette_is_lava' => $section['palette_is_lava'],
+                'palette_uses_grass_tint' => $section['palette_uses_grass_tint'],
+                'palette_uses_foliage_tint' => $section['palette_uses_foliage_tint'],
+                'palette_colors' => $section['palette_colors'],
+                'uniform_palette_index' => $section['uniform_palette_index'],
+                'block_data_words' => $section['block_data_words'],
+                'bits_per_entry' => $section['bits_per_entry'],
+                'values_per_long' => $section['values_per_long'],
+                'uses_padded_layout' => $section['uses_padded_layout'],
+                'biome_palette_tints' => $section['biome_palette_tints'],
+                'biome_uniform_palette_index' => $section['biome_uniform_palette_index'],
+                'biome_data_words' => $section['biome_data_words'],
+                'biome_bits_per_entry' => $section['biome_bits_per_entry'],
+                'biome_values_per_long' => $section['biome_values_per_long'],
+                'biome_uses_padded_layout' => $section['biome_uses_padded_layout'],
+            ];
+        }
+
+        return $normalizedSections;
     }
 
     /**
