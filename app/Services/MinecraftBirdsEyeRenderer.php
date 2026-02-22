@@ -883,6 +883,7 @@ class MinecraftBirdsEyeRenderer
                 'palette' => $section['palette'],
                 'palette_is_air' => $section['palette_is_air'],
                 'palette_is_water' => $section['palette_is_water'],
+                'palette_is_lava' => $section['palette_is_lava'],
                 'palette_uses_grass_tint' => $section['palette_uses_grass_tint'],
                 'palette_uses_foliage_tint' => $section['palette_uses_foliage_tint'],
                 'palette_colors' => $section['palette_colors'],
@@ -909,6 +910,7 @@ class MinecraftBirdsEyeRenderer
      *     palette: array<int, string>,
      *     palette_is_air: array<int, bool>,
      *     palette_is_water: array<int, bool>,
+     *     palette_is_lava: array<int, bool>,
      *     palette_uses_grass_tint: array<int, bool>,
      *     palette_uses_foliage_tint: array<int, bool>,
      *     palette_colors: array<int, array{0:int,1:int,2:int}>,
@@ -969,6 +971,7 @@ class MinecraftBirdsEyeRenderer
 
         $paletteIsAir = [];
         $paletteIsWater = [];
+        $paletteIsLava = [];
         $paletteUsesGrassTint = [];
         $paletteUsesFoliageTint = [];
         $paletteColors = [];
@@ -976,6 +979,7 @@ class MinecraftBirdsEyeRenderer
         foreach ($palette as $index => $blockName) {
             $paletteIsAir[$index] = $this->isAirLikeBlock($blockName);
             $paletteIsWater[$index] = $this->isWaterLikeBlock($blockName);
+            $paletteIsLava[$index] = $this->isLavaLikeBlock($blockName);
             $paletteUsesGrassTint[$index] = $this->isGrassTintedBlock($blockName);
             $paletteUsesFoliageTint[$index] = $this->isFoliageTintedBlock($blockName);
             $paletteColors[$index] = $this->colorForBlock($blockName);
@@ -1026,6 +1030,7 @@ class MinecraftBirdsEyeRenderer
             'palette' => $palette,
             'palette_is_air' => $paletteIsAir,
             'palette_is_water' => $paletteIsWater,
+            'palette_is_lava' => $paletteIsLava,
             'palette_uses_grass_tint' => $paletteUsesGrassTint,
             'palette_uses_foliage_tint' => $paletteUsesFoliageTint,
             'palette_colors' => $paletteColors,
@@ -1578,6 +1583,11 @@ class MinecraftBirdsEyeRenderer
     private function isWaterLikeBlock(string $blockName): bool
     {
         return in_array($blockName, ['minecraft:water', 'minecraft:bubble_column'], true);
+    }
+
+    private function isLavaLikeBlock(string $blockName): bool
+    {
+        return in_array($blockName, ['minecraft:lava'], true);
     }
 
     private function clampHeight(int $height): int

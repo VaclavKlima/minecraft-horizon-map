@@ -179,6 +179,7 @@ class MinecraftIsometricRenderer
                 'section_y' => (int) $sectionY,
                 'palette_is_air' => $section['palette_is_air'],
                 'palette_is_water' => $section['palette_is_water'],
+                'palette_is_lava' => $section['palette_is_lava'],
                 'palette_uses_grass_tint' => $section['palette_uses_grass_tint'],
                 'palette_uses_foliage_tint' => $section['palette_uses_foliage_tint'],
                 'palette_colors' => $section['palette_colors'],

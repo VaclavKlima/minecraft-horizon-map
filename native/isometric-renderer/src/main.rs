@@ -35,6 +35,8 @@ struct SectionInput {
     section_y: i32,
     palette_is_air: Vec<bool>,
     palette_is_water: Vec<bool>,
+    #[serde(default)]
+    palette_is_lava: Vec<bool>,
     palette_uses_grass_tint: Vec<bool>,
     palette_uses_foliage_tint: Vec<bool>,
     palette_colors: Vec<[u8; 3]>,
@@ -144,6 +146,26 @@ fn apply_water_depth_shading(red: u8, green: u8, blue: u8, water_depth: u16) -> 
     let shaded_blue = apply_brightness(blue, brightness_factor) as i32 + depth_blue_lift;
 
     (shaded_red, shaded_green, shaded_blue.clamp(0, 255) as u8)
+}
+
+fn apply_lava_depth_shading(red: u8, green: u8, blue: u8, lava_depth: u16) -> (u8, u8, u8) {
+    if lava_depth <= 1 {
+        return (red, green, blue);
+    }
+
+    let depth_steps = (lava_depth.saturating_sub(1).min(16)) as f64;
+    let brightness_factor = 1.0 - (depth_steps * 0.035);
+    let red_lift = (depth_steps * 1.6).round() as i32;
+    let blue_drop = (depth_steps * 2.2).round() as i32;
+    let shaded_red = apply_brightness(red, brightness_factor) as i32 + red_lift;
+    let shaded_green = apply_brightness(green, brightness_factor * 0.96);
+    let shaded_blue = apply_brightness(blue, brightness_factor * 0.82) as i32 - blue_drop;
+
+    (
+        shaded_red.clamp(0, 255) as u8,
+        shaded_green,
+        shaded_blue.clamp(0, 255) as u8,
+    )
 }
 
 fn write_png(path: &str, width: usize, height: usize, rgba: &[u8]) -> Result<(), String> {
@@ -268,6 +290,14 @@ fn is_air_palette(section: &SectionInput, palette_index: usize) -> bool {
 fn is_water_palette(section: &SectionInput, palette_index: usize) -> bool {
     section
         .palette_is_water
+        .get(palette_index)
+        .copied()
+        .unwrap_or(false)
+}
+
+fn is_lava_palette(section: &SectionInput, palette_index: usize) -> bool {
+    section
+        .palette_is_lava
         .get(palette_index)
         .copied()
         .unwrap_or(false)
@@ -426,6 +456,7 @@ fn set_voxel(
     occupancy: &mut [u8],
     colors: &mut [u8],
     water_mask: &mut [u8],
+    lava_mask: &mut [u8],
     source_width: usize,
     height_span: usize,
     world_x: usize,
@@ -433,6 +464,7 @@ fn set_voxel(
     y_offset: usize,
     color: [u8; 3],
     is_water: bool,
+    is_lava: bool,
 ) {
     let column_index = (world_z * source_width) + world_x;
     let voxel_index = (column_index * height_span) + y_offset;
@@ -445,12 +477,66 @@ fn set_voxel(
     colors[color_offset + 1] = color[1];
     colors[color_offset + 2] = color[2];
     water_mask[voxel_index] = if is_water { 1 } else { 0 };
+    lava_mask[voxel_index] = if is_lava { 1 } else { 0 };
 }
 
 fn is_voxel_solid(occupancy: &[u8], voxel_index: usize) -> bool {
     let byte_index = voxel_index >> 3;
     let bit_index = voxel_index & 7;
     (occupancy[byte_index] & (1u8 << bit_index)) != 0
+}
+
+fn compute_fluid_depths(
+    occupancy: &[u8],
+    fluid_mask: &[u8],
+    total_columns: usize,
+    height_span: usize,
+    total_voxels: usize,
+) -> Vec<u16> {
+    let mut fluid_depths = vec![0u16; total_voxels];
+
+    for column_index in 0..total_columns {
+        let column_base_index = column_index * height_span;
+        let mut segment_top: Option<usize> = None;
+        let mut segment_length: usize = 0;
+
+        for y_offset in (0..height_span).rev() {
+            let voxel_index = column_base_index + y_offset;
+            let is_fluid_voxel =
+                is_voxel_solid(occupancy, voxel_index) && fluid_mask[voxel_index] == 1;
+
+            if is_fluid_voxel {
+                if segment_top.is_none() {
+                    segment_top = Some(y_offset);
+                }
+
+                segment_length += 1;
+                continue;
+            }
+
+            if let Some(top) = segment_top {
+                let bottom = y_offset + 1;
+                let clamped_depth = segment_length.min(u16::MAX as usize) as u16;
+
+                for fill_y in bottom..=top {
+                    fluid_depths[column_base_index + fill_y] = clamped_depth;
+                }
+            }
+
+            segment_top = None;
+            segment_length = 0;
+        }
+
+        if let Some(top) = segment_top {
+            let clamped_depth = segment_length.min(u16::MAX as usize) as u16;
+
+            for fill_y in 0..=top {
+                fluid_depths[column_base_index + fill_y] = clamped_depth;
+            }
+        }
+    }
+
+    fluid_depths
 }
 
 fn log_missing_palette_color(
@@ -621,6 +707,7 @@ fn main() -> ExitCode {
     let mut occupancy = vec![0u8; (total_voxels + 7) / 8];
     let mut colors = vec![0u8; total_voxels * 3];
     let mut water_mask = vec![0u8; total_voxels];
+    let mut lava_mask = vec![0u8; total_voxels];
     let mut logged_missing_palette_colors: HashSet<(i32, i32, i32, usize)> = HashSet::new();
 
     for chunk in &input.chunks {
@@ -651,6 +738,7 @@ fn main() -> ExitCode {
                     [90, 90, 92]
                 });
                 let is_water = is_water_palette(section, uniform_palette_index);
+                let is_lava = is_lava_palette(section, uniform_palette_index);
 
                 for local_y in 0..16usize {
                     let world_y = (section.section_y * 16) + local_y as i32;
@@ -680,6 +768,7 @@ fn main() -> ExitCode {
                                 &mut occupancy,
                                 &mut colors,
                                 &mut water_mask,
+                                &mut lava_mask,
                                 source_width,
                                 height_span,
                                 world_x,
@@ -687,6 +776,7 @@ fn main() -> ExitCode {
                                 y_offset,
                                 tinted_color,
                                 is_water,
+                                is_lava,
                             );
                         }
                     }
@@ -726,6 +816,7 @@ fn main() -> ExitCode {
                             [90, 90, 92]
                         });
                         let is_water = is_water_palette(section, palette_index);
+                        let is_lava = is_lava_palette(section, palette_index);
                         let biome_index =
                             biome_palette_index_at(section, local_x, local_z, local_y);
                         let biome_tint = biome_tint(section, biome_index);
@@ -741,6 +832,7 @@ fn main() -> ExitCode {
                             &mut occupancy,
                             &mut colors,
                             &mut water_mask,
+                            &mut lava_mask,
                             source_width,
                             height_span,
                             world_x,
@@ -748,6 +840,7 @@ fn main() -> ExitCode {
                             y_offset,
                             tinted_color,
                             is_water,
+                            is_lava,
                         );
                     }
                 }
@@ -755,47 +848,20 @@ fn main() -> ExitCode {
         }
     }
 
-    let mut water_depths = vec![0u16; total_voxels];
-    for column_index in 0..total_columns {
-        let column_base_index = column_index * height_span;
-        let mut segment_top: Option<usize> = None;
-        let mut segment_length: usize = 0;
-
-        for y_offset in (0..height_span).rev() {
-            let voxel_index = column_base_index + y_offset;
-            let is_water_voxel =
-                is_voxel_solid(&occupancy, voxel_index) && water_mask[voxel_index] == 1;
-
-            if is_water_voxel {
-                if segment_top.is_none() {
-                    segment_top = Some(y_offset);
-                }
-
-                segment_length += 1;
-                continue;
-            }
-
-            if let Some(top) = segment_top {
-                let bottom = y_offset + 1;
-                let clamped_depth = segment_length.min(u16::MAX as usize) as u16;
-
-                for fill_y in bottom..=top {
-                    water_depths[column_base_index + fill_y] = clamped_depth;
-                }
-            }
-
-            segment_top = None;
-            segment_length = 0;
-        }
-
-        if let Some(top) = segment_top {
-            let clamped_depth = segment_length.min(u16::MAX as usize) as u16;
-
-            for fill_y in 0..=top {
-                water_depths[column_base_index + fill_y] = clamped_depth;
-            }
-        }
-    }
+    let water_depths = compute_fluid_depths(
+        &occupancy,
+        &water_mask,
+        total_columns,
+        height_span,
+        total_voxels,
+    );
+    let lava_depths = compute_fluid_depths(
+        &occupancy,
+        &lava_mask,
+        total_columns,
+        height_span,
+        total_voxels,
+    );
 
     let mut runs: Vec<RunsEntry> = Vec::new();
     for column_index in 0..total_columns {
@@ -980,6 +1046,8 @@ fn main() -> ExitCode {
                     top_blue,
                     water_depths[top_voxel_index],
                 )
+            } else if lava_mask[top_voxel_index] == 1 {
+                apply_lava_depth_shading(top_red, top_green, top_blue, lava_depths[top_voxel_index])
             } else {
                 (top_red, top_green, top_blue)
             };
