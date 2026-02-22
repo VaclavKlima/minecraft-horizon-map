@@ -145,6 +145,13 @@
             let isometricOverviewLayerVersion = 0;
             let isometricOverviewPreloadTimer = null;
             let overviewRefreshPending = false;
+            let overviewIsometricImage = null;
+            let overviewIsometricImageUrl = '';
+            let overviewIsometricPendingUrl = '';
+            let isometricLayerLoaderWorker = null;
+            let isometricLayerLoaderWorkerUrl = null;
+            let isometricWorkerLoadFailures = 0;
+            let isometricWorkerDisabled = true;
 
             const isometricLayerCache = new Map();
 
@@ -153,8 +160,187 @@
             const maxIsometricOverzoomLevels = 2;
             const maxWebglTextureUploadsPerFrame = 2;
             const maxVisibleLayerRequestsPerFrame = 2;
+            const maxVisibleLayerRequestsWhileDragging = 1;
+            const maxTextureUploadsWhileDragging = 1;
+            const workerFallbackDelayMs = 2200;
+            const maxWorkerFailuresBeforeDisable = 3;
             const usingWebglIsometric = webglContext !== null;
             const urlParams = new URLSearchParams(window.location.search);
+
+            function markIsometricLayerLoaded(cacheEntry) {
+                cacheEntry.loaded = true;
+                isometricOverviewLayerVersion++;
+                if (!isDragging) {
+                    scheduleIsometricOverviewPreload();
+                }
+                requestRenderTiles();
+            }
+
+            function markIsometricLayerFailed(cacheEntry) {
+                cacheEntry.failed = true;
+                isometricOverviewLayerVersion++;
+                if (!isDragging) {
+                    scheduleIsometricOverviewPreload();
+                }
+            }
+
+            function loadIsometricLayerWithImage(cacheEntry, highPriority) {
+                if (cacheEntry.image !== null) {
+                    return;
+                }
+
+                const image = new Image();
+                image.decoding = 'async';
+                image.loading = highPriority ? 'eager' : 'lazy';
+                image.fetchPriority = highPriority ? 'high' : 'low';
+                cacheEntry.image = image;
+                image.onload = () => {
+                    markIsometricLayerLoaded(cacheEntry);
+                };
+                image.onerror = () => {
+                    markIsometricLayerFailed(cacheEntry);
+                };
+                image.src = cacheEntry.url;
+            }
+
+            function disableIsometricWorkerLoader(reason = 'worker disabled') {
+                if (isometricWorkerDisabled) {
+                    return;
+                }
+
+                isometricWorkerDisabled = true;
+
+                if (isometricLayerLoaderWorker !== null) {
+                    isometricLayerLoaderWorker.terminate();
+                    isometricLayerLoaderWorker = null;
+                }
+
+                if (isometricLayerLoaderWorkerUrl !== null) {
+                    URL.revokeObjectURL(isometricLayerLoaderWorkerUrl);
+                    isometricLayerLoaderWorkerUrl = null;
+                }
+
+                console.warn('isometric-worker disabled, using Image fallback only', {
+                    reason,
+                    failures: isometricWorkerLoadFailures,
+                });
+
+                for (const entry of isometricLayerCache.values()) {
+                    if (!entry.loaded && !entry.failed && entry.image === null) {
+                        entry.requested = false;
+                        loadIsometricLayerWithImage(entry, false);
+                    }
+                }
+            }
+
+            function ensureIsometricLayerLoaderWorker() {
+                if (
+                    isometricWorkerDisabled
+                    || !window.isSecureContext
+                    ||
+                    isometricLayerLoaderWorker !== null
+                    || typeof Worker === 'undefined'
+                    || typeof createImageBitmap === 'undefined'
+                ) {
+                    return isometricLayerLoaderWorker !== null;
+                }
+
+                const workerSource = `
+                    self.onmessage = async (event) => {
+                        const payload = event.data || {};
+                        if (payload.type !== 'load' || typeof payload.key !== 'string' || typeof payload.url !== 'string') {
+                            return;
+                        }
+
+                        try {
+                            const response = await fetch(payload.url, { cache: 'force-cache', credentials: 'same-origin' });
+                            if (!response.ok) {
+                                throw new Error('HTTP ' + response.status);
+                            }
+
+                            const blob = await response.blob();
+                            const bitmap = await createImageBitmap(blob);
+                            self.postMessage({ type: 'loaded', key: payload.key, bitmap }, [bitmap]);
+                        } catch (error) {
+                            self.postMessage({
+                                type: 'failed',
+                                key: payload.key,
+                                message: error instanceof Error ? error.message : 'unknown',
+                            });
+                        }
+                    };
+                `;
+
+                try {
+                    const blob = new Blob([workerSource], { type: 'text/javascript' });
+                    isometricLayerLoaderWorkerUrl = URL.createObjectURL(blob);
+                    isometricLayerLoaderWorker = new Worker(isometricLayerLoaderWorkerUrl);
+                } catch (error) {
+                    if (isometricLayerLoaderWorkerUrl !== null) {
+                        URL.revokeObjectURL(isometricLayerLoaderWorkerUrl);
+                        isometricLayerLoaderWorkerUrl = null;
+                    }
+                    isometricLayerLoaderWorker = null;
+                    return false;
+                }
+                isometricLayerLoaderWorker.onmessage = event => {
+                    const payload = event.data || {};
+                    const key = typeof payload.key === 'string' ? payload.key : '';
+
+                    if (key === '') {
+                        return;
+                    }
+
+                    const cacheEntry = isometricLayerCache.get(key);
+                    if (!cacheEntry) {
+                        if (payload.type === 'loaded' && payload.bitmap && typeof payload.bitmap.close === 'function') {
+                            payload.bitmap.close();
+                        }
+                        return;
+                    }
+
+                    if (payload.type === 'loaded' && payload.bitmap) {
+                        if (cacheEntry.loaded && cacheEntry.image !== null) {
+                            if (typeof payload.bitmap.close === 'function') {
+                                payload.bitmap.close();
+                            }
+                            return;
+                        }
+
+                        cacheEntry.bitmap = payload.bitmap;
+                        markIsometricLayerLoaded(cacheEntry);
+                        return;
+                    }
+
+                    cacheEntry.requested = false;
+                    cacheEntry.bitmap = null;
+                    isometricWorkerLoadFailures++;
+
+                    if (isometricWorkerLoadFailures >= maxWorkerFailuresBeforeDisable) {
+                        disableIsometricWorkerLoader(payload.message ?? 'repeated worker load failures');
+                    } else {
+                        console.warn('isometric-worker load failed; falling back to Image loader', {
+                            key,
+                            failures: isometricWorkerLoadFailures,
+                            message: payload.message ?? 'unknown',
+                        });
+                    }
+
+                    if (!cacheEntry.loaded && !cacheEntry.failed) {
+                        loadIsometricLayerWithImage(cacheEntry, false);
+                        cacheEntry.requested = true;
+                        return;
+                    }
+
+                    markIsometricLayerFailed(cacheEntry);
+                };
+                isometricLayerLoaderWorker.onerror = event => {
+                    isometricWorkerLoadFailures++;
+                    disableIsometricWorkerLoader(event.message || 'worker runtime error');
+                };
+
+                return true;
+            }
 
             if (urlParams.get('projection') === 'isometric') {
                 selectedProjection = 'isometric';
@@ -494,7 +680,7 @@
                 }
             }
 
-            function createWebglTextureFromImage(image) {
+            function createWebglTextureFromSource(source) {
                 if (!usingWebglIsometric || webglContext === null) {
                     return null;
                 }
@@ -517,8 +703,14 @@
                     webglContext.RGBA,
                     webglContext.RGBA,
                     webglContext.UNSIGNED_BYTE,
-                    image
+                    source
                 );
+
+                const glError = webglContext.getError();
+                if (glError !== webglContext.NO_ERROR) {
+                    webglContext.deleteTexture(texture);
+                    return null;
+                }
 
                 return texture;
             }
@@ -535,34 +727,16 @@
                         continue;
                     }
 
-                    const image = new Image();
-                    image.decoding = 'async';
                     const entry = {
-                        image,
+                        key,
+                        image: null,
+                        bitmap: null,
                         loaded: false,
                         failed: false,
                         texture: null,
                         requested: false,
                         url: layer.url,
-                    };
-                    image.onload = () => {
-                        entry.loaded = true;
-                        isometricOverviewLayerVersion++;
-                        overviewBaseCacheKey = '';
-                        overviewBaseReady = false;
-                        if (!isDragging) {
-                            scheduleIsometricOverviewPreload();
-                        }
-                        requestRenderTiles();
-                    };
-                    image.onerror = () => {
-                        entry.failed = true;
-                        isometricOverviewLayerVersion++;
-                        overviewBaseCacheKey = '';
-                        overviewBaseReady = false;
-                        if (!isDragging) {
-                            scheduleIsometricOverviewPreload();
-                        }
+                        workerRequestedAt: 0,
                     };
                     isometricLayerCache.set(key, entry);
                 }
@@ -572,6 +746,9 @@
                         const staleEntry = isometricLayerCache.get(existingKey);
                         if (usingWebglIsometric && webglContext !== null && staleEntry?.texture) {
                             webglContext.deleteTexture(staleEntry.texture);
+                        }
+                        if (staleEntry?.bitmap && typeof staleEntry.bitmap.close === 'function') {
+                            staleEntry.bitmap.close();
                         }
                         isometricLayerCache.delete(existingKey);
                     }
@@ -584,9 +761,30 @@
                 }
 
                 cacheEntry.requested = true;
-                cacheEntry.image.loading = highPriority ? 'eager' : 'lazy';
-                cacheEntry.image.fetchPriority = highPriority ? 'high' : 'low';
-                cacheEntry.image.src = cacheEntry.url;
+                if (ensureIsometricLayerLoaderWorker()) {
+                    cacheEntry.workerRequestedAt = performance.now();
+                    isometricLayerLoaderWorker.postMessage({
+                        type: 'load',
+                        key: cacheEntry.key,
+                        url: cacheEntry.url,
+                        priority: highPriority ? 'high' : 'low',
+                    });
+
+                    window.setTimeout(() => {
+                        if (cacheEntry.loaded || cacheEntry.failed || cacheEntry.image !== null) {
+                            return;
+                        }
+
+                        if (cacheEntry.workerRequestedAt <= 0) {
+                            return;
+                        }
+
+                        loadIsometricLayerWithImage(cacheEntry, highPriority);
+                    }, workerFallbackDelayMs);
+                    return;
+                }
+
+                loadIsometricLayerWithImage(cacheEntry, highPriority);
             }
 
             function stopIsometricOverviewPreload() {
@@ -704,6 +902,45 @@
                 });
             }
 
+            function syncIsometricOverviewImage() {
+                if (selectedProjection !== 'isometric' || !manifest) {
+                    return;
+                }
+
+                const minimap = manifest.minimap ?? null;
+                const nextUrl = typeof minimap?.url === 'string' ? minimap.url : '';
+
+                if (
+                    nextUrl === ''
+                    || nextUrl === overviewIsometricImageUrl
+                    || nextUrl === overviewIsometricPendingUrl
+                ) {
+                    return;
+                }
+
+                overviewIsometricPendingUrl = nextUrl;
+                const image = new Image();
+                image.decoding = 'async';
+                image.loading = 'eager';
+                image.fetchPriority = 'high';
+                image.onload = () => {
+                    if (overviewIsometricPendingUrl !== nextUrl) {
+                        return;
+                    }
+
+                    overviewIsometricImage = image;
+                    overviewIsometricImageUrl = nextUrl;
+                    overviewIsometricPendingUrl = '';
+                    requestRenderTiles();
+                };
+                image.onerror = () => {
+                    if (overviewIsometricPendingUrl === nextUrl) {
+                        overviewIsometricPendingUrl = '';
+                    }
+                };
+                image.src = nextUrl;
+            }
+
             function stopBatchPolling() {
                 activeBatchId = null;
                 pollCount = 0;
@@ -775,9 +1012,76 @@
                 const drawnHeight = sourceMapHeight * scale;
                 const originX = Math.floor((cssWidth - drawnWidth) / 2);
                 const originY = Math.floor((desiredHeight - drawnHeight) / 2);
-                const overviewKey = `${selectedProjection}:${selectedRegion ?? 'all'}:${manifest.generated_at ?? ''}:${cssWidth}:${desiredHeight}:${sourceMapWidth}:${sourceMapHeight}:${isometricOverviewLayerVersion}`;
+                const overviewKey = `${selectedProjection}:${selectedRegion ?? 'all'}:${manifest.generated_at ?? ''}:${cssWidth}:${desiredHeight}:${sourceMapWidth}:${sourceMapHeight}`;
 
-                if (overviewBaseCacheKey !== overviewKey || !overviewBaseReady) {
+                if (selectedProjection === 'isometric') {
+                    syncIsometricOverviewImage();
+                    const minimap = manifest.minimap ?? null;
+                    const minimapSourceWidth = Math.max(
+                        1,
+                        Number.parseInt(String(minimap?.source_width ?? sourceMapWidth), 10)
+                    );
+                    const minimapSourceHeight = Math.max(
+                        1,
+                        Number.parseInt(String(minimap?.source_height ?? sourceMapHeight), 10)
+                    );
+                    const minimapScale = Math.min(cssWidth / minimapSourceWidth, desiredHeight / minimapSourceHeight);
+                    const minimapDrawnWidth = minimapSourceWidth * minimapScale;
+                    const minimapDrawnHeight = minimapSourceHeight * minimapScale;
+                    const minimapOriginX = Math.floor((cssWidth - minimapDrawnWidth) / 2);
+                    const minimapOriginY = Math.floor((desiredHeight - minimapDrawnHeight) / 2);
+
+                    overviewContext.clearRect(0, 0, cssWidth, desiredHeight);
+                    overviewContext.imageSmoothingEnabled = false;
+                    overviewContext.fillStyle = '#0f172a';
+                    overviewContext.fillRect(minimapOriginX, minimapOriginY, minimapDrawnWidth, minimapDrawnHeight);
+
+                    if (overviewIsometricImage !== null) {
+                        overviewContext.drawImage(
+                            overviewIsometricImage,
+                            minimapOriginX,
+                            minimapOriginY,
+                            minimapDrawnWidth,
+                            minimapDrawnHeight
+                        );
+                        overviewBaseReady = true;
+                    } else {
+                        overviewContext.fillStyle = '#111827';
+                        overviewContext.fillRect(minimapOriginX, minimapOriginY, minimapDrawnWidth, minimapDrawnHeight);
+                        overviewBaseReady = false;
+                    }
+
+                    overviewContext.strokeStyle = '#334155';
+                    overviewContext.lineWidth = 1;
+                    overviewContext.strokeRect(minimapOriginX + 0.5, minimapOriginY + 0.5, Math.max(0, minimapDrawnWidth - 1), Math.max(0, minimapDrawnHeight - 1));
+
+                    const sourceOffsetX = offsetX * divisor;
+                    const sourceOffsetY = offsetY * divisor;
+                    const sourceViewportWidth = viewport.clientWidth * divisor;
+                    const sourceViewportHeight = viewport.clientHeight * divisor;
+                    const viewportRectX = minimapOriginX + (sourceOffsetX * minimapScale);
+                    const viewportRectY = minimapOriginY + (sourceOffsetY * minimapScale);
+                    const viewportRectWidth = Math.max(6, sourceViewportWidth * minimapScale);
+                    const viewportRectHeight = Math.max(6, sourceViewportHeight * minimapScale);
+                    overviewContext.fillStyle = 'rgba(16, 185, 129, 0.18)';
+                    overviewContext.fillRect(viewportRectX, viewportRectY, viewportRectWidth, viewportRectHeight);
+                    overviewContext.strokeStyle = '#10b981';
+                    overviewContext.lineWidth = 1.2;
+                    overviewContext.strokeRect(viewportRectX + 0.5, viewportRectY + 0.5, Math.max(0, viewportRectWidth - 1), Math.max(0, viewportRectHeight - 1));
+
+                    overviewMapState = {
+                        originX: minimapOriginX,
+                        originY: minimapOriginY,
+                        scale: minimapScale,
+                        mapWidth: minimapSourceWidth,
+                        mapHeight: minimapSourceHeight,
+                        divisor,
+                    };
+                    overviewStatusEl.textContent = overviewBaseReady
+                        ? `View ${Math.round(offsetX)},${Math.round(offsetY)} @ z${zoom}`
+                        : 'Loading...';
+                    return;
+                } else if (overviewBaseCacheKey !== overviewKey || !overviewBaseReady) {
                     overviewBaseCanvas.width = cssWidth;
                     overviewBaseCanvas.height = desiredHeight;
                     overviewBaseContext.clearRect(0, 0, cssWidth, desiredHeight);
@@ -786,32 +1090,7 @@
                     overviewBaseContext.fillRect(originX, originY, drawnWidth, drawnHeight);
                     let backgroundReady = false;
 
-                    if (selectedProjection === 'isometric') {
-                        const layers = Array.isArray(manifest?.image_layers) ? manifest.image_layers : [];
-                        let drawnLayerCount = 0;
-
-                        for (const layer of layers) {
-                            const cacheKey = `${layer.file}:${layer.url}`;
-                            const cacheEntry = isometricLayerCache.get(cacheKey);
-
-                            if (!cacheEntry || !cacheEntry.loaded || cacheEntry.failed) {
-                                continue;
-                            }
-
-                            const sourceLayerX = Number(layer.offset_x ?? 0);
-                            const sourceLayerY = Number(layer.offset_y ?? 0);
-                            const sourceLayerWidth = Math.max(1, Number(layer.width ?? 0));
-                            const sourceLayerHeight = Math.max(1, Number(layer.height ?? 0));
-                            const targetX = originX + ((sourceLayerX / sourceMapWidth) * drawnWidth);
-                            const targetY = originY + ((sourceLayerY / sourceMapHeight) * drawnHeight);
-                            const targetWidth = Math.max(1, (sourceLayerWidth / sourceMapWidth) * drawnWidth);
-                            const targetHeight = Math.max(1, (sourceLayerHeight / sourceMapHeight) * drawnHeight);
-                            overviewBaseContext.drawImage(cacheEntry.image, targetX, targetY, targetWidth, targetHeight);
-                            drawnLayerCount++;
-                        }
-
-                        backgroundReady = drawnLayerCount > 0;
-                    } else {
+                    {
                         const minOverviewZoom = uiMinZoom();
                         const minOverviewInfo = levelInfo(minOverviewZoom);
 
@@ -962,8 +1241,11 @@
                     let hasPendingVisibleTextures = false;
                     let visibleLayerRequestsThisFrame = 0;
                     const maxVisibleRequestsThisFrame = isDragging
-                        ? 0
+                        ? maxVisibleLayerRequestsWhileDragging
                         : maxVisibleLayerRequestsPerFrame;
+                    const maxTextureUploadsThisFrame = isDragging
+                        ? maxTextureUploadsWhileDragging
+                        : maxWebglTextureUploadsPerFrame;
 
                     if (usingWebglIsometric && webglContext !== null) {
                         initializeWebglRenderer();
@@ -1059,17 +1341,22 @@
 
                         if (usingWebglIsometric && webglContext !== null) {
                             if (!cacheEntry.texture) {
-                                if (isDragging) {
+                                if (textureUploadsThisFrame >= maxTextureUploadsThisFrame) {
                                     hasPendingVisibleTextures = true;
                                     continue;
                                 }
 
-                                if (textureUploadsThisFrame >= maxWebglTextureUploadsPerFrame) {
-                                    hasPendingVisibleTextures = true;
+                                const textureSource = cacheEntry.bitmap ?? cacheEntry.image ?? null;
+                                if (!textureSource) {
                                     continue;
                                 }
 
-                                cacheEntry.texture = createWebglTextureFromImage(cacheEntry.image);
+                                cacheEntry.texture = createWebglTextureFromSource(textureSource);
+                                if (cacheEntry.texture === null && cacheEntry.bitmap !== null && cacheEntry.image === null) {
+                                    loadIsometricLayerWithImage(cacheEntry, true);
+                                    hasPendingVisibleTextures = true;
+                                    continue;
+                                }
                                 textureUploadsThisFrame++;
                             }
 
@@ -1099,13 +1386,25 @@
                             webglContext.bufferData(webglContext.ARRAY_BUFFER, vertices, webglContext.STREAM_DRAW);
                             webglContext.drawArrays(webglContext.TRIANGLES, 0, 6);
                         } else if (isometricContext !== null) {
-                            const sourceX = Math.floor(normalizedClipX * cacheEntry.image.naturalWidth);
-                            const sourceY = Math.floor(normalizedClipY * cacheEntry.image.naturalHeight);
-                            const sourceWidth = Math.max(1, Math.ceil((normalizedClipX2 - normalizedClipX) * cacheEntry.image.naturalWidth));
-                            const sourceHeight = Math.max(1, Math.ceil((normalizedClipY2 - normalizedClipY) * cacheEntry.image.naturalHeight));
+                            const drawable = cacheEntry.bitmap ?? cacheEntry.image ?? null;
+                            const sourceWidthPx = drawable
+                                ? (Number(drawable.width ?? 0) || Number(drawable.naturalWidth ?? 0))
+                                : 0;
+                            const sourceHeightPx = drawable
+                                ? (Number(drawable.height ?? 0) || Number(drawable.naturalHeight ?? 0))
+                                : 0;
+
+                            if (!drawable || sourceWidthPx <= 0 || sourceHeightPx <= 0) {
+                                continue;
+                            }
+
+                            const sourceX = Math.floor(normalizedClipX * sourceWidthPx);
+                            const sourceY = Math.floor(normalizedClipY * sourceHeightPx);
+                            const sourceWidth = Math.max(1, Math.ceil((normalizedClipX2 - normalizedClipX) * sourceWidthPx));
+                            const sourceHeight = Math.max(1, Math.ceil((normalizedClipY2 - normalizedClipY) * sourceHeightPx));
 
                             isometricContext.drawImage(
-                                cacheEntry.image,
+                                drawable,
                                 sourceX,
                                 sourceY,
                                 sourceWidth,
@@ -1132,7 +1431,7 @@
                     }
                     scheduleUrlStateSync();
 
-                    if (hasPendingVisibleTextures && !isDragging) {
+                    if (hasPendingVisibleTextures) {
                         requestRenderTiles();
                     }
 
@@ -1341,8 +1640,11 @@
                     isometricOverviewLayerVersion = 0;
                     syncIsometricLayerCache();
                     scheduleIsometricOverviewPreload();
+                    syncIsometricOverviewImage();
                 } else if (selectedProjection !== 'isometric') {
                     stopIsometricOverviewPreload();
+                } else {
+                    syncIsometricOverviewImage();
                 }
                 if (includeRegions) {
                     renderRegionOptions();
@@ -1565,6 +1867,20 @@
                     includeRegions: true,
                     refresh: true,
                 }).catch(error => setStatus(error.message));
+            });
+
+            window.addEventListener('beforeunload', () => {
+                stopIsometricOverviewPreload();
+
+                if (isometricLayerLoaderWorker !== null) {
+                    isometricLayerLoaderWorker.terminate();
+                    isometricLayerLoaderWorker = null;
+                }
+
+                if (isometricLayerLoaderWorkerUrl !== null) {
+                    URL.revokeObjectURL(isometricLayerLoaderWorkerUrl);
+                    isometricLayerLoaderWorkerUrl = null;
+                }
             });
 
             loadManifest(null, {

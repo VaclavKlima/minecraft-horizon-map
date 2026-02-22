@@ -2,6 +2,7 @@
 
 namespace App\Services;
 
+use App\Jobs\GenerateIsometricMinimapJob;
 use Illuminate\Filesystem\Filesystem;
 use RuntimeException;
 
@@ -12,6 +13,10 @@ class MinecraftIsometricTileService
     private const MANIFEST_VERSION = 3;
 
     private const OVERZOOM_LEVELS = 6;
+
+    private const MINIMAP_MAX_DIMENSION = 640;
+
+    private const MINIMAP_DISPATCH_COOLDOWN_SECONDS = 45;
 
     public function __construct(private Filesystem $files) {}
 
@@ -66,6 +71,11 @@ class MinecraftIsometricTileService
         $manifest['selected_region'] = $selectedRegion;
         $manifest['available_levels'] = $this->manifestLevels($manifest);
         $manifest['image_layers'] = $this->imageLayersForManifest($selectedRegion, $manifest);
+        $manifest['minimap'] = $this->buildMinimapDescriptor($selectedRegion, $manifest, false);
+
+        if ($manifest['minimap'] === null) {
+            $this->dispatchMinimapBuild($selectedRegion);
+        }
 
         if ($includeRegions) {
             $manifest['available_regions'] = array_values(array_unique(array_merge([self::ALL_REGIONS], array_column($availableRegions, 'file'))));
@@ -83,6 +93,21 @@ class MinecraftIsometricTileService
         bool $refreshManifest = true
     ): ?string {
         return null;
+    }
+
+    public function rebuildMinimap(?string $regionFile = null): void
+    {
+        $selectedRegion = $regionFile ?? self::ALL_REGIONS;
+        $manifestPath = $this->manifestPath($selectedRegion);
+
+        if (! $this->files->exists($manifestPath)) {
+            return;
+        }
+
+        /** @var array<string, mixed> $manifest */
+        $manifest = json_decode($this->files->get($manifestPath), true, flags: JSON_THROW_ON_ERROR);
+        $this->buildMinimapDescriptor($selectedRegion, $manifest, true);
+        $this->clearMinimapDispatchLock($selectedRegion);
     }
 
     public function rebuildRegionTiles(string $regionFile): void
@@ -510,5 +535,347 @@ class MinecraftIsometricTileService
     private function imageUrlForRegion(string $regionFile, string $versionToken): string
     {
         return '/maps/isometric/regions/'.str_replace('.mca', '.png', $regionFile).'?t='.$versionToken;
+    }
+
+    /**
+     * @param  array<string, mixed>  $manifest
+     * @return array{
+     *   url:string,
+     *   width:int,
+     *   height:int,
+     *   source_width:int,
+     *   source_height:int
+     * }|null
+     */
+    private function buildMinimapDescriptor(string $selectedRegion, array $manifest, bool $allowBuild): ?array
+    {
+        if ($selectedRegion === self::ALL_REGIONS) {
+            return $this->buildCombinedMinimapDescriptor($manifest, $allowBuild);
+        }
+
+        return $this->buildRegionMinimapDescriptor($selectedRegion, $allowBuild);
+    }
+
+    /**
+     * @param  array<string, mixed>  $manifest
+     * @return array{
+     *   url:string,
+     *   width:int,
+     *   height:int,
+     *   source_width:int,
+     *   source_height:int
+     * }|null
+     */
+    private function buildCombinedMinimapDescriptor(array $manifest, bool $allowBuild): ?array
+    {
+        $sourceWidth = (int) ($manifest['source_width'] ?? 0);
+        $sourceHeight = (int) ($manifest['source_height'] ?? 0);
+        $sourceSignature = (string) ($manifest['source_signature'] ?? '');
+        $generatedAt = (int) ($manifest['generated_at'] ?? 0);
+        $placements = $manifest['placements'] ?? [];
+
+        if ($sourceWidth <= 0 || $sourceHeight <= 0 || $sourceSignature === '' || ! is_array($placements)) {
+            return null;
+        }
+
+        $relativeImagePath = 'maps/isometric/minimap/all.png';
+        $imagePath = public_path($relativeImagePath);
+        $metaPath = public_path('maps/isometric/minimap/all.meta.json');
+        $signature = sha1($sourceSignature.'|'.$sourceWidth.'|'.$sourceHeight);
+
+        if (! $this->isMinimapFresh($imagePath, $metaPath, $signature)) {
+            if (! $allowBuild) {
+                if (! $this->files->exists($imagePath) || ! $this->files->exists($metaPath)) {
+                    return null;
+                }
+            } else {
+                $this->safeEnsureDirectoryExists(dirname($imagePath));
+
+                $built = $this->buildCombinedMinimapImage(
+                    $imagePath,
+                    $placements,
+                    $sourceWidth,
+                    $sourceHeight
+                );
+
+                if (! $built) {
+                    return null;
+                }
+
+                $this->files->put(
+                    $metaPath,
+                    json_encode([
+                        'signature' => $signature,
+                        'width' => $built['width'],
+                        'height' => $built['height'],
+                    ], JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR)
+                );
+            }
+        }
+
+        /** @var array<string, mixed> $meta */
+        $meta = json_decode($this->files->get($metaPath), true, flags: JSON_THROW_ON_ERROR);
+        $minimapWidth = (int) ($meta['width'] ?? 0);
+        $minimapHeight = (int) ($meta['height'] ?? 0);
+
+        if ($minimapWidth <= 0 || $minimapHeight <= 0) {
+            return null;
+        }
+
+        return [
+            'url' => '/'.$relativeImagePath.'?t='.$generatedAt,
+            'width' => $minimapWidth,
+            'height' => $minimapHeight,
+            'source_width' => $sourceWidth,
+            'source_height' => $sourceHeight,
+        ];
+    }
+
+    /**
+     * @return array{
+     *   url:string,
+     *   width:int,
+     *   height:int,
+     *   source_width:int,
+     *   source_height:int
+     * }|null
+     */
+    private function buildRegionMinimapDescriptor(string $regionFile, bool $allowBuild): ?array
+    {
+        $sourcePath = $this->sourceMapPath($regionFile);
+
+        if (! $this->files->exists($sourcePath)) {
+            return null;
+        }
+
+        [$sourceWidth, $sourceHeight] = getimagesize($sourcePath) ?: [0, 0];
+        if ($sourceWidth <= 0 || $sourceHeight <= 0) {
+            return null;
+        }
+
+        $regionKey = $this->regionKey($regionFile);
+        $relativeImagePath = 'maps/isometric/minimap/'.$regionKey.'.png';
+        $imagePath = public_path($relativeImagePath);
+        $metaPath = public_path('maps/isometric/minimap/'.$regionKey.'.meta.json');
+        $signature = sha1((string) $this->files->lastModified($sourcePath).'|'.(string) $this->files->size($sourcePath));
+
+        if (! $this->isMinimapFresh($imagePath, $metaPath, $signature)) {
+            if (! $allowBuild) {
+                if (! $this->files->exists($imagePath) || ! $this->files->exists($metaPath)) {
+                    return null;
+                }
+            } else {
+                $this->safeEnsureDirectoryExists(dirname($imagePath));
+                $built = $this->buildSingleImageMinimap($sourcePath, $imagePath, $sourceWidth, $sourceHeight);
+
+                if (! $built) {
+                    return null;
+                }
+
+                $this->files->put(
+                    $metaPath,
+                    json_encode([
+                        'signature' => $signature,
+                        'width' => $built['width'],
+                        'height' => $built['height'],
+                    ], JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR)
+                );
+            }
+        }
+
+        /** @var array<string, mixed> $meta */
+        $meta = json_decode($this->files->get($metaPath), true, flags: JSON_THROW_ON_ERROR);
+        $minimapWidth = (int) ($meta['width'] ?? 0);
+        $minimapHeight = (int) ($meta['height'] ?? 0);
+
+        if ($minimapWidth <= 0 || $minimapHeight <= 0) {
+            return null;
+        }
+
+        return [
+            'url' => '/'.$relativeImagePath.'?t='.$this->files->lastModified($sourcePath),
+            'width' => $minimapWidth,
+            'height' => $minimapHeight,
+            'source_width' => (int) $sourceWidth,
+            'source_height' => (int) $sourceHeight,
+        ];
+    }
+
+    private function isMinimapFresh(string $imagePath, string $metaPath, string $signature): bool
+    {
+        if (! $this->files->exists($imagePath) || ! $this->files->exists($metaPath)) {
+            return false;
+        }
+
+        try {
+            /** @var array<string, mixed> $meta */
+            $meta = json_decode($this->files->get($metaPath), true, flags: JSON_THROW_ON_ERROR);
+        } catch (\Throwable) {
+            return false;
+        }
+
+        return (string) ($meta['signature'] ?? '') === $signature;
+    }
+
+    /**
+     * @param  array<int, array<string, mixed>>  $placements
+     * @return array{width:int,height:int}|null
+     */
+    private function buildCombinedMinimapImage(
+        string $outputPath,
+        array $placements,
+        int $sourceWidth,
+        int $sourceHeight
+    ): ?array {
+        $scale = min(
+            1.0,
+            self::MINIMAP_MAX_DIMENSION / max(1, max($sourceWidth, $sourceHeight))
+        );
+        $targetWidth = max(1, (int) floor($sourceWidth * $scale));
+        $targetHeight = max(1, (int) floor($sourceHeight * $scale));
+        $canvas = imagecreatetruecolor($targetWidth, $targetHeight);
+
+        if ($canvas === false) {
+            return null;
+        }
+
+        imagealphablending($canvas, true);
+        imagesavealpha($canvas, true);
+        $backgroundColor = imagecolorallocate($canvas, 15, 23, 42);
+        imagefill($canvas, 0, 0, $backgroundColor);
+
+        foreach ($placements as $placement) {
+            $file = (string) ($placement['file'] ?? '');
+
+            if ($file === '') {
+                continue;
+            }
+
+            $regionImagePath = $this->sourceMapPath($file);
+
+            if (! $this->files->exists($regionImagePath)) {
+                continue;
+            }
+
+            $sourceImage = @imagecreatefrompng($regionImagePath);
+            if ($sourceImage === false) {
+                continue;
+            }
+
+            $offsetX = (int) ($placement['offset_x'] ?? 0);
+            $offsetY = (int) ($placement['offset_y'] ?? 0);
+            $placementWidth = (int) ($placement['width'] ?? 0);
+            $placementHeight = (int) ($placement['height'] ?? 0);
+            $dstX = (int) floor($offsetX * $scale);
+            $dstY = (int) floor($offsetY * $scale);
+            $dstWidth = max(1, (int) floor($placementWidth * $scale));
+            $dstHeight = max(1, (int) floor($placementHeight * $scale));
+            imagecopyresampled(
+                $canvas,
+                $sourceImage,
+                $dstX,
+                $dstY,
+                0,
+                0,
+                $dstWidth,
+                $dstHeight,
+                max(1, imagesx($sourceImage)),
+                max(1, imagesy($sourceImage))
+            );
+            imagedestroy($sourceImage);
+        }
+
+        imagepng($canvas, $outputPath);
+        imagedestroy($canvas);
+
+        return [
+            'width' => $targetWidth,
+            'height' => $targetHeight,
+        ];
+    }
+
+    /**
+     * @return array{width:int,height:int}|null
+     */
+    private function buildSingleImageMinimap(
+        string $sourcePath,
+        string $outputPath,
+        int $sourceWidth,
+        int $sourceHeight
+    ): ?array {
+        $sourceImage = @imagecreatefrompng($sourcePath);
+        if ($sourceImage === false) {
+            return null;
+        }
+
+        $scale = min(
+            1.0,
+            self::MINIMAP_MAX_DIMENSION / max(1, max($sourceWidth, $sourceHeight))
+        );
+        $targetWidth = max(1, (int) floor($sourceWidth * $scale));
+        $targetHeight = max(1, (int) floor($sourceHeight * $scale));
+        $canvas = imagecreatetruecolor($targetWidth, $targetHeight);
+
+        if ($canvas === false) {
+            imagedestroy($sourceImage);
+
+            return null;
+        }
+
+        imagealphablending($canvas, true);
+        imagesavealpha($canvas, true);
+        imagecopyresampled(
+            $canvas,
+            $sourceImage,
+            0,
+            0,
+            0,
+            0,
+            $targetWidth,
+            $targetHeight,
+            max(1, imagesx($sourceImage)),
+            max(1, imagesy($sourceImage))
+        );
+        imagepng($canvas, $outputPath);
+        imagedestroy($canvas);
+        imagedestroy($sourceImage);
+
+        return [
+            'width' => $targetWidth,
+            'height' => $targetHeight,
+        ];
+    }
+
+    private function dispatchMinimapBuild(string $selectedRegion): void
+    {
+        $lockPath = $this->minimapDispatchLockPath($selectedRegion);
+        $now = time();
+        $lastDispatchedAt = $this->files->exists($lockPath)
+            ? (int) trim($this->files->get($lockPath))
+            : 0;
+
+        if (($now - $lastDispatchedAt) < self::MINIMAP_DISPATCH_COOLDOWN_SECONDS) {
+            return;
+        }
+
+        $this->safeEnsureDirectoryExists(dirname($lockPath));
+        $this->files->put($lockPath, (string) $now);
+        GenerateIsometricMinimapJob::dispatch($selectedRegion === self::ALL_REGIONS ? null : $selectedRegion);
+    }
+
+    private function clearMinimapDispatchLock(string $selectedRegion): void
+    {
+        $lockPath = $this->minimapDispatchLockPath($selectedRegion);
+
+        if ($this->files->exists($lockPath)) {
+            $this->files->delete($lockPath);
+        }
+    }
+
+    private function minimapDispatchLockPath(string $selectedRegion): string
+    {
+        return storage_path(
+            'app'.DIRECTORY_SEPARATOR.'isometric-minimap'.DIRECTORY_SEPARATOR.$this->regionKey($selectedRegion).'.dispatch.lock'
+        );
     }
 }
