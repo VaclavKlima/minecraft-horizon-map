@@ -144,6 +144,7 @@
             let overviewBaseReady = false;
             let isometricOverviewLayerVersion = 0;
             let isometricOverviewPreloadTimer = null;
+            let overviewRefreshPending = false;
 
             const isometricLayerCache = new Map();
 
@@ -151,6 +152,7 @@
             const preloadTileMargin = 1;
             const maxIsometricOverzoomLevels = 2;
             const maxWebglTextureUploadsPerFrame = 2;
+            const maxVisibleLayerRequestsPerFrame = 2;
             const usingWebglIsometric = webglContext !== null;
             const urlParams = new URLSearchParams(window.location.search);
 
@@ -548,7 +550,9 @@
                         isometricOverviewLayerVersion++;
                         overviewBaseCacheKey = '';
                         overviewBaseReady = false;
-                        scheduleIsometricOverviewPreload();
+                        if (!isDragging) {
+                            scheduleIsometricOverviewPreload();
+                        }
                         requestRenderTiles();
                     };
                     image.onerror = () => {
@@ -556,7 +560,9 @@
                         isometricOverviewLayerVersion++;
                         overviewBaseCacheKey = '';
                         overviewBaseReady = false;
-                        scheduleIsometricOverviewPreload();
+                        if (!isDragging) {
+                            scheduleIsometricOverviewPreload();
+                        }
                     };
                     isometricLayerCache.set(key, entry);
                 }
@@ -617,7 +623,7 @@
             function scheduleIsometricOverviewPreload() {
                 stopIsometricOverviewPreload();
 
-                if (!manifest || selectedProjection !== 'isometric') {
+                if (!manifest || selectedProjection !== 'isometric' || isDragging) {
                     return;
                 }
 
@@ -954,6 +960,10 @@
                     let prefetchedLayers = 0;
                     let textureUploadsThisFrame = 0;
                     let hasPendingVisibleTextures = false;
+                    let visibleLayerRequestsThisFrame = 0;
+                    const maxVisibleRequestsThisFrame = isDragging
+                        ? 0
+                        : maxVisibleLayerRequestsPerFrame;
 
                     if (usingWebglIsometric && webglContext !== null) {
                         initializeWebglRenderer();
@@ -1013,8 +1023,16 @@
                         }
 
                         if (intersectsViewport) {
-                            requestIsometricLayerImage(cacheEntry, true);
-                        } else if (!cacheEntry.loaded && !cacheEntry.failed && prefetchedLayers < 1) {
+                            if (
+                                !cacheEntry.loaded
+                                && !cacheEntry.failed
+                                && !cacheEntry.requested
+                                && visibleLayerRequestsThisFrame < maxVisibleRequestsThisFrame
+                            ) {
+                                requestIsometricLayerImage(cacheEntry, true);
+                                visibleLayerRequestsThisFrame++;
+                            }
+                        } else if (!isDragging && !cacheEntry.loaded && !cacheEntry.failed && prefetchedLayers < 1) {
                             requestIsometricLayerImage(cacheEntry, false);
                             prefetchedLayers++;
                         }
@@ -1041,6 +1059,11 @@
 
                         if (usingWebglIsometric && webglContext !== null) {
                             if (!cacheEntry.texture) {
+                                if (isDragging) {
+                                    hasPendingVisibleTextures = true;
+                                    continue;
+                                }
+
                                 if (textureUploadsThisFrame >= maxWebglTextureUploadsPerFrame) {
                                     hasPendingVisibleTextures = true;
                                     continue;
@@ -1101,10 +1124,15 @@
                     tilesEl.textContent = `${info.width} x ${info.height}`;
                     visibleTilesEl.textContent = `${drawnLayerCount}/${visibleLayerCount} layers`;
                     renderMsEl.textContent = `${Math.round(performance.now() - renderStartedAt)}`;
-                    renderOverviewMap();
+                    if (isDragging) {
+                        overviewRefreshPending = true;
+                    } else {
+                        renderOverviewMap();
+                        overviewRefreshPending = false;
+                    }
                     scheduleUrlStateSync();
 
-                    if (hasPendingVisibleTextures) {
+                    if (hasPendingVisibleTextures && !isDragging) {
                         requestRenderTiles();
                     }
 
@@ -1442,6 +1470,7 @@
 
             viewport.addEventListener('mousedown', event => {
                 isDragging = true;
+                stopIsometricOverviewPreload();
                 dragStartX = event.clientX;
                 dragStartY = event.clientY;
                 dragOriginX = offsetX;
@@ -1449,7 +1478,16 @@
             });
 
             window.addEventListener('mouseup', () => {
+                const wasDragging = isDragging;
                 isDragging = false;
+
+                if (wasDragging) {
+                    scheduleIsometricOverviewPreload();
+
+                    if (overviewRefreshPending) {
+                        requestRenderTiles();
+                    }
+                }
             });
 
             window.addEventListener('mousemove', event => {
