@@ -98,7 +98,8 @@ class MinecraftMapTileService
         $manifest = json_decode($this->files->get($this->manifestPath($selectedRegion)), true, flags: JSON_THROW_ON_ERROR);
 
         $manifest['selected_region'] = $selectedRegion;
-        $manifest['available_levels'] = $this->availableTileLevels($selectedRegion, $manifest);
+        $manifest['available_levels'] = $this->manifestLevels($manifest);
+        $manifest['image_layers'] = $this->imageLayersForManifest($selectedRegion, $manifest);
 
         if ($includeMinimap) {
             $manifest['minimap'] = $this->buildMinimapDescriptor($selectedRegion, $manifest, false);
@@ -282,6 +283,7 @@ class MinecraftMapTileService
 
         $manifest = [
             'manifest_version' => self::MANIFEST_VERSION,
+            'projection' => 'birds-eye',
             'generated_at' => time(),
             'tile_size' => $tileSize,
             'source_width' => $width,
@@ -402,6 +404,7 @@ class MinecraftMapTileService
 
         $manifest = [
             'manifest_version' => self::MANIFEST_VERSION,
+            'projection' => 'birds-eye',
             'generated_at' => time(),
             'tile_size' => $tileSize,
             'source_width' => $width,
@@ -584,6 +587,89 @@ class MinecraftMapTileService
     private function sourceMapPath(string $regionFile): string
     {
         return public_path('maps/regions'.DIRECTORY_SEPARATOR.str_replace('.mca', '.png', $regionFile));
+    }
+
+    /**
+     * @param  array<string, mixed>  $manifest
+     * @return array<int, int>
+     */
+    private function manifestLevels(array $manifest): array
+    {
+        $levels = array_keys((array) ($manifest['levels'] ?? []));
+        $parsedLevels = array_map(static fn (string $level): int => (int) $level, $levels);
+        sort($parsedLevels);
+
+        return $parsedLevels;
+    }
+
+    /**
+     * @param  array<string, mixed>  $manifest
+     * @return array<int, array{file:string,url:string,offset_x:int,offset_y:int,width:int,height:int}>
+     */
+    private function imageLayersForManifest(string $selectedRegion, array $manifest): array
+    {
+        $versionToken = (string) ($manifest['generated_at'] ?? time());
+
+        if ($selectedRegion !== self::ALL_REGIONS) {
+            return [[
+                'file' => $selectedRegion,
+                'url' => $this->imageUrlForRegion($selectedRegion, $versionToken),
+                'offset_x' => 0,
+                'offset_y' => 0,
+                'width' => (int) ($manifest['source_width'] ?? 0),
+                'height' => (int) ($manifest['source_height'] ?? 0),
+            ]];
+        }
+
+        $regions = $manifest['regions'] ?? [];
+        if (! is_array($regions)) {
+            return [];
+        }
+
+        $worldMinX = (int) ($manifest['world_min_x'] ?? 0);
+        $worldMinZ = (int) ($manifest['world_min_z'] ?? 0);
+        $layers = [];
+
+        foreach ($regions as $region) {
+            if (! is_array($region)) {
+                continue;
+            }
+
+            $file = (string) ($region['file'] ?? '');
+            if ($file === '') {
+                continue;
+            }
+
+            $regionX = (int) ($region['region_x'] ?? 0);
+            $regionZ = (int) ($region['region_z'] ?? 0);
+            $offsetX = ($regionX * 512) - $worldMinX;
+            $offsetY = ($regionZ * 512) - $worldMinZ;
+            $layers[] = [
+                'file' => $file,
+                'url' => $this->imageUrlForRegion($file, $versionToken),
+                'offset_x' => $offsetX,
+                'offset_y' => $offsetY,
+                'width' => 512,
+                'height' => 512,
+            ];
+        }
+
+        usort($layers, static function (array $left, array $right): int {
+            $yComparison = $left['offset_y'] <=> $right['offset_y'];
+
+            if ($yComparison !== 0) {
+                return $yComparison;
+            }
+
+            return $left['offset_x'] <=> $right['offset_x'];
+        });
+
+        return $layers;
+    }
+
+    private function imageUrlForRegion(string $regionFile, string $versionToken): string
+    {
+        return '/maps/regions/'.str_replace('.mca', '.png', $regionFile).'?t='.$versionToken;
     }
 
     private function manifestPath(string $regionFile): string

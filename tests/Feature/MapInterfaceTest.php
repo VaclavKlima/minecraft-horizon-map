@@ -28,24 +28,24 @@ it('loads the interactive map page', function () {
         ->assertSee('Minecraft Horizon Map');
 });
 
-it('returns map manifest and tile image', function () {
+it('returns map manifest with birds-eye image layers', function () {
     seedFakeBirdsEyeMap();
 
-    $manifestResponse = $this->getJson('/api/maps/manifest');
+    $manifestResponse = $this->getJson('/api/maps/manifest?region=r.0.0.mca');
     $manifestResponse->assertSuccessful()
         ->assertJsonPath('available', true)
-        ->assertJsonPath('manifest.tile_size', 256)
-        ->assertJsonPath('manifest.selected_region', 'all');
-
-    $tileResponse = $this->get('/api/maps/tiles/1/0/0.png?region=all');
-    $tileResponse->assertSuccessful();
-    expect($tileResponse->headers->get('content-type'))->toContain('image/png');
+        ->assertJsonPath('manifest.projection', 'birds-eye')
+        ->assertJsonPath('manifest.selected_region', 'r.0.0.mca')
+        ->assertJsonPath('manifest.image_layers.0.file', 'r.0.0.mca')
+        ->assertJsonPath('manifest.image_layers.0.offset_x', 0)
+        ->assertJsonPath('manifest.image_layers.0.offset_y', 0)
+        ->assertJsonPath('manifest.image_layers.0.width', 512)
+        ->assertJsonPath('manifest.image_layers.0.height', 512);
 });
 
 function seedFakeBirdsEyeMap(): void
 {
     File::ensureDirectoryExists(public_path('maps/regions'));
-    File::deleteDirectory(public_path('maps/tiles'));
 
     $image = imagecreatetruecolor(512, 512);
     $green = imagecolorallocate($image, 96, 150, 66);

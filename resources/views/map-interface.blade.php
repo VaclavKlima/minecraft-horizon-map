@@ -37,7 +37,7 @@
                             type="button"
                             class="rounded-md bg-emerald-500 px-3 py-2 text-sm font-semibold text-slate-900 transition hover:bg-emerald-400"
                         >
-                            Queue Tile Jobs
+                            Queue Map Jobs
                         </button>
                     </div>
                 </div>
@@ -110,7 +110,7 @@
             let dragStartY = 0;
             let dragOriginX = 0;
             let dragOriginY = 0;
-            let activeTiles = new Map();
+            let birdsEyeLayerCache = new Map();
             let selectedProjection = 'birds-eye';
             let requestedViewState = null;
             let urlSyncTimeout = null;
@@ -118,7 +118,6 @@
             let batchPollTimer = null;
             let renderFrameRequested = false;
             let cursorFrameRequested = false;
-            let birdsEyeRetryTimer = null;
             let lastPointerClientX = 0;
             let lastPointerClientY = 0;
             let pollCount = 0;
@@ -150,8 +149,6 @@
 
             const isometricLayerCache = new Map();
 
-            const tileSize = 256;
-            const preloadTileMargin = 1;
             const maxIsometricOverzoomLevels = 2;
             const maxWebglTextureUploadsPerFrame = 2;
             const maxVisibleLayerRequestsPerFrame = 2;
@@ -159,7 +156,6 @@
             const maxTextureUploadsWhileDragging = 1;
             const workerFallbackDelayMs = 2200;
             const maxWorkerFailuresBeforeDisable = 3;
-            const birdsEyeTileRetryDelayMs = 1500;
             const usingWebglIsometric = webglContext !== null;
             const urlParams = new URLSearchParams(window.location.search);
 
@@ -374,17 +370,6 @@
                     .sort((left, right) => left - right);
             }
 
-            function availableZoomLevels() {
-                const levels = Array.isArray(manifest?.available_levels)
-                    ? manifest.available_levels
-                        .map(value => Number.parseInt(String(value), 10))
-                        .filter(Number.isInteger)
-                        .sort((left, right) => left - right)
-                    : [];
-
-                return levels;
-            }
-
             function uiMaxZoom() {
                 const levels = manifestZoomLevels();
 
@@ -442,16 +427,6 @@
                 return 2 ** (nativeMaxZoom - level);
             }
 
-            function maxStaticZoomLevel() {
-                const levels = availableZoomLevels();
-
-                if (levels.length === 0) {
-                    return -1;
-                }
-
-                return levels[levels.length - 1];
-            }
-
             function clampOffsets() {
                 const info = levelInfo(zoom);
                 const maxOffsetX = Math.max(0, info.width - viewport.clientWidth);
@@ -459,6 +434,227 @@
 
                 offsetX = Math.max(0, Math.min(maxOffsetX, offsetX));
                 offsetY = Math.max(0, Math.min(maxOffsetY, offsetY));
+            }
+
+            function parseRegionCoordinates(regionFile) {
+                const match = String(regionFile ?? '').match(/^r\.(-?\d+)\.(-?\d+)\.mca$/);
+
+                if (!match) {
+                    return null;
+                }
+
+                return {
+                    regionX: Number.parseInt(match[1], 10),
+                    regionZ: Number.parseInt(match[2], 10),
+                };
+            }
+
+            function isometricPlacements() {
+                if (!manifest) {
+                    return [];
+                }
+
+                const placements = Array.isArray(manifest.placements) ? manifest.placements : [];
+                if (placements.length > 0) {
+                    return placements
+                        .map(placement => ({
+                            region_x: Number.parseInt(String(placement.region_x ?? ''), 10),
+                            region_z: Number.parseInt(String(placement.region_z ?? ''), 10),
+                            offset_x: Number(placement.offset_x ?? 0),
+                            offset_y: Number(placement.offset_y ?? 0),
+                            width: Number(placement.width ?? 0),
+                            height: Number(placement.height ?? 0),
+                        }))
+                        .filter(placement => Number.isInteger(placement.region_x) && Number.isInteger(placement.region_z));
+                }
+
+                const layers = Array.isArray(manifest.image_layers) ? manifest.image_layers : [];
+
+                return layers
+                    .map(layer => {
+                        const coords = parseRegionCoordinates(layer.file ?? '');
+
+                        if (!coords) {
+                            return null;
+                        }
+
+                        return {
+                            region_x: coords.regionX,
+                            region_z: coords.regionZ,
+                            offset_x: Number(layer.offset_x ?? 0),
+                            offset_y: Number(layer.offset_y ?? 0),
+                            width: Number(layer.width ?? 0),
+                            height: Number(layer.height ?? 0),
+                        };
+                    })
+                    .filter(Boolean);
+            }
+
+            function isometricPixelScale() {
+                const placements = isometricPlacements();
+                const placementWithWidth = placements.find(placement => Number.isFinite(placement.width) && placement.width > 0);
+
+                if (placementWithWidth) {
+                    return Math.max(1, Math.round(placementWithWidth.width / 1026));
+                }
+
+                const sourceWidth = Number(manifest?.source_width ?? 0);
+                if (sourceWidth > 0) {
+                    return Math.max(1, Math.round(sourceWidth / 1026));
+                }
+
+                return 1;
+            }
+
+            function isometricRegionAnchorX() {
+                return 512 * isometricPixelScale();
+            }
+
+            function findPlacementByWorld(worldX, worldZ) {
+                const placements = isometricPlacements();
+                if (placements.length === 0) {
+                    return null;
+                }
+
+                const regionX = Math.floor(worldX / 512);
+                const regionZ = Math.floor(worldZ / 512);
+                const exactMatch = placements.find(
+                    placement => placement.region_x === regionX && placement.region_z === regionZ
+                );
+
+                if (exactMatch) {
+                    return exactMatch;
+                }
+
+                let nearestPlacement = null;
+                let nearestDistance = Number.POSITIVE_INFINITY;
+
+                for (const placement of placements) {
+                    const dx = placement.region_x - regionX;
+                    const dz = placement.region_z - regionZ;
+                    const distance = (dx * dx) + (dz * dz);
+
+                    if (distance < nearestDistance) {
+                        nearestDistance = distance;
+                        nearestPlacement = placement;
+                    }
+                }
+
+                return nearestPlacement;
+            }
+
+            function worldCenterFromIsometricViewport() {
+                if (!manifest) {
+                    return null;
+                }
+
+                const placements = isometricPlacements();
+                if (placements.length === 0) {
+                    const divisor = mapDivisor(zoom);
+
+                    return {
+                        x: (manifest.world_min_x ?? 0) + ((offsetX + (viewport.clientWidth / 2)) * divisor),
+                        z: (manifest.world_min_z ?? 0) + ((offsetY + (viewport.clientHeight / 2)) * divisor),
+                    };
+                }
+
+                const divisor = mapDivisor(zoom);
+                const pixelScale = isometricPixelScale();
+                const anchorX = isometricRegionAnchorX();
+                const sourceX = (offsetX + (viewport.clientWidth / 2)) * divisor;
+                const sourceY = (offsetY + (viewport.clientHeight / 2)) * divisor;
+                let best = null;
+                let bestPenalty = Number.POSITIVE_INFINITY;
+
+                for (const placement of placements) {
+                    const relativeX = sourceX - placement.offset_x - anchorX;
+                    const relativeY = sourceY - placement.offset_y;
+                    const localX = (relativeX + (2 * relativeY)) / (2 * pixelScale);
+                    const localZ = ((2 * relativeY) - relativeX) / (2 * pixelScale);
+                    const overflowX = localX < 0 ? -localX : Math.max(0, localX - 512);
+                    const overflowZ = localZ < 0 ? -localZ : Math.max(0, localZ - 512);
+                    const penalty = overflowX + overflowZ;
+
+                    if (penalty >= bestPenalty) {
+                        continue;
+                    }
+
+                    bestPenalty = penalty;
+                    best = {
+                        placement,
+                        localX,
+                        localZ,
+                    };
+                }
+
+                if (!best) {
+                    return null;
+                }
+
+                const clampedLocalX = Math.max(0, Math.min(511.999, best.localX));
+                const clampedLocalZ = Math.max(0, Math.min(511.999, best.localZ));
+
+                return {
+                    x: (best.placement.region_x * 512) + clampedLocalX,
+                    z: (best.placement.region_z * 512) + clampedLocalZ,
+                };
+            }
+
+            function applyWorldCenterToIsometricViewport(center) {
+                if (!manifest || !center) {
+                    return;
+                }
+
+                const placement = findPlacementByWorld(center.x, center.z);
+                if (!placement) {
+                    return;
+                }
+
+                const divisor = mapDivisor(zoom);
+                const pixelScale = isometricPixelScale();
+                const anchorX = isometricRegionAnchorX();
+                const localX = center.x - (placement.region_x * 512);
+                const localZ = center.z - (placement.region_z * 512);
+                const sourceX = placement.offset_x + anchorX + ((localX - localZ) * pixelScale);
+                const sourceY = placement.offset_y + (((localX + localZ) * pixelScale) / 2);
+                offsetX = (sourceX / divisor) - (viewport.clientWidth / 2);
+                offsetY = (sourceY / divisor) - (viewport.clientHeight / 2);
+            }
+
+            function currentViewportWorldCenter() {
+                if (!manifest) {
+                    return null;
+                }
+
+                if (selectedProjection === 'isometric') {
+                    return worldCenterFromIsometricViewport();
+                }
+
+                const divisor = mapDivisor(zoom);
+                const worldMinX = manifest.world_min_x ?? 0;
+                const worldMinZ = manifest.world_min_z ?? 0;
+
+                return {
+                    x: worldMinX + ((offsetX + (viewport.clientWidth / 2)) * divisor),
+                    z: worldMinZ + ((offsetY + (viewport.clientHeight / 2)) * divisor),
+                };
+            }
+
+            function applyViewportWorldCenter(center) {
+                if (!manifest || !center) {
+                    return;
+                }
+
+                if (selectedProjection === 'isometric') {
+                    applyWorldCenterToIsometricViewport(center);
+                    return;
+                }
+
+                const divisor = mapDivisor(zoom);
+                const worldMinX = manifest.world_min_x ?? 0;
+                const worldMinZ = manifest.world_min_z ?? 0;
+                offsetX = ((center.x - worldMinX) / divisor) - (viewport.clientWidth / 2);
+                offsetY = ((center.z - worldMinZ) / divisor) - (viewport.clientHeight / 2);
             }
 
             function setStatus(message) {
@@ -472,62 +668,13 @@
                 return params.toString();
             }
 
-            function regionKeyForPath(regionFile) {
-                return String(regionFile ?? 'all').replaceAll('.', '_').replaceAll('/', '_');
-            }
-
-            function tileBasePath() {
-                const regionKey = regionKeyForPath(manifest?.selected_region ?? 'all');
-
-                return `/maps/tiles/${regionKey}`;
-            }
-
-            function tileUrl(level, x, y) {
-                const params = new URLSearchParams();
-
-                if (manifest?.generated_at) {
-                    params.set('t', String(manifest.generated_at));
-                }
-
-                if (level <= maxStaticZoomLevel()) {
-                    return `${tileBasePath()}/${level}/${x}/${y}.png?${params.toString()}`;
-                }
-
-                params.set('projection', selectedProjection);
-
-                return `/api/maps/tiles/${level}/${x}/${y}.png?${params.toString()}`;
-            }
-
-            function apiTileUrl(level, x, y) {
-                const params = new URLSearchParams();
-
-                if (manifest?.generated_at) {
-                    params.set('t', String(manifest.generated_at));
-                }
-
-                params.set('projection', selectedProjection);
-
-                return `/api/maps/tiles/${level}/${x}/${y}.png?${params.toString()}`;
-            }
-
-            function urlWithRetryToken(url) {
-                const separator = url.includes('?') ? '&' : '?';
-
-                return `${url}${separator}retry=${Date.now()}`;
-            }
-
             function resetActiveTiles() {
-                if (birdsEyeRetryTimer !== null) {
-                    window.clearTimeout(birdsEyeRetryTimer);
-                    birdsEyeRetryTimer = null;
-                }
-
-                activeTiles.forEach(tile => {
-                    if (tile?.bitmap && typeof tile.bitmap.close === 'function') {
-                        tile.bitmap.close();
+                birdsEyeLayerCache.forEach(layer => {
+                    if (layer?.bitmap && typeof layer.bitmap.close === 'function') {
+                        layer.bitmap.close();
                     }
                 });
-                activeTiles.clear();
+                birdsEyeLayerCache.clear();
                 clearBirdsEyeCanvas();
                 clearIsometricCanvas();
             }
@@ -739,6 +886,73 @@
                 }
 
                 return texture;
+            }
+
+            function syncBirdsEyeLayerCache() {
+                const layers = Array.isArray(manifest?.image_layers) ? manifest.image_layers : [];
+                const nextKeys = new Set();
+
+                for (const layer of layers) {
+                    const key = `${layer.file}:${layer.url}`;
+                    nextKeys.add(key);
+
+                    if (birdsEyeLayerCache.has(key)) {
+                        continue;
+                    }
+
+                    birdsEyeLayerCache.set(key, {
+                        key,
+                        image: null,
+                        bitmap: null,
+                        loaded: false,
+                        failed: false,
+                        requested: false,
+                        url: layer.url,
+                    });
+                }
+
+                for (const existingKey of birdsEyeLayerCache.keys()) {
+                    if (!nextKeys.has(existingKey)) {
+                        const staleEntry = birdsEyeLayerCache.get(existingKey);
+                        if (staleEntry?.bitmap && typeof staleEntry.bitmap.close === 'function') {
+                            staleEntry.bitmap.close();
+                        }
+                        birdsEyeLayerCache.delete(existingKey);
+                    }
+                }
+            }
+
+            function requestBirdsEyeLayerImage(cacheEntry, highPriority) {
+                if (!cacheEntry || cacheEntry.requested || cacheEntry.loaded || cacheEntry.failed) {
+                    return;
+                }
+
+                const image = new Image();
+                image.draggable = false;
+                image.decoding = 'async';
+                image.loading = highPriority ? 'eager' : 'lazy';
+                image.fetchPriority = highPriority ? 'high' : 'low';
+                cacheEntry.image = image;
+                cacheEntry.requested = true;
+
+                image.onload = async () => {
+                    cacheEntry.failed = false;
+                    cacheEntry.loaded = true;
+                    if (typeof createImageBitmap === 'function') {
+                        try {
+                            cacheEntry.bitmap = await createImageBitmap(image);
+                        } catch {
+                            cacheEntry.bitmap = null;
+                        }
+                    }
+                    requestRenderTiles();
+                };
+                image.onerror = () => {
+                    cacheEntry.loaded = false;
+                    cacheEntry.failed = true;
+                    requestRenderTiles();
+                };
+                image.src = cacheEntry.url;
             }
 
             function syncIsometricLayerCache() {
@@ -1420,166 +1634,103 @@
                     return;
                 }
 
-                const staticMaxZoom = maxStaticZoomLevel();
-                const renderZoom = staticMaxZoom >= 0 ? Math.min(zoom, staticMaxZoom) : zoom;
-                const renderInfo = levelInfo(renderZoom);
+                ensureBirdsEyeCanvasSize();
+                clearBirdsEyeCanvas();
+                syncBirdsEyeLayerCache();
 
-                if (!renderInfo) {
+                const layers = Array.isArray(manifest?.image_layers) ? manifest.image_layers : [];
+                const divisor = mapDivisor(zoom);
+                let visibleLayerCount = 0;
+                let drawnLayerCount = 0;
+                let pendingLayerCount = 0;
+
+                if (birdsEyeContext === null) {
                     return;
                 }
 
-                const scale = 2 ** (zoom - renderZoom);
-                const scaledTileSize = tileSize * scale;
-                const sourceOffsetX = offsetX / scale;
-                const sourceOffsetY = offsetY / scale;
-                const visibleMinTileX = Math.floor(sourceOffsetX / tileSize);
-                const visibleMinTileY = Math.floor(sourceOffsetY / tileSize);
-                const visibleMaxTileX = Math.min(renderInfo.tiles_x - 1, Math.floor((sourceOffsetX + (viewport.clientWidth / scale)) / tileSize));
-                const visibleMaxTileY = Math.min(renderInfo.tiles_y - 1, Math.floor((sourceOffsetY + (viewport.clientHeight / scale)) / tileSize));
-                const minTileX = Math.max(0, visibleMinTileX - preloadTileMargin);
-                const minTileY = Math.max(0, visibleMinTileY - preloadTileMargin);
-                const maxTileX = Math.min(renderInfo.tiles_x - 1, visibleMaxTileX + preloadTileMargin);
-                const maxTileY = Math.min(renderInfo.tiles_y - 1, visibleMaxTileY + preloadTileMargin);
-                const nextKeys = new Set();
-                let visibleTileCount = 0;
-                let drawnTileCount = 0;
-                let pendingTileCount = 0;
-                const renderNow = performance.now();
-                let nextRetryAt = null;
+                birdsEyeContext.imageSmoothingEnabled = false;
 
-                ensureBirdsEyeCanvasSize();
-                clearBirdsEyeCanvas();
+                for (const layer of layers) {
+                    const cacheKey = `${layer.file}:${layer.url}`;
+                    const cacheEntry = birdsEyeLayerCache.get(cacheKey);
+                    const layerLeft = ((layer.offset_x ?? 0) / divisor) - offsetX;
+                    const layerTop = ((layer.offset_y ?? 0) / divisor) - offsetY;
+                    const layerRight = (((layer.offset_x ?? 0) + (layer.width ?? 0)) / divisor) - offsetX;
+                    const layerBottom = (((layer.offset_y ?? 0) + (layer.height ?? 0)) / divisor) - offsetY;
+                    const intersectsViewport = layerRight >= 0
+                        && layerBottom >= 0
+                        && layerLeft <= viewport.clientWidth
+                        && layerTop <= viewport.clientHeight;
 
-                if (birdsEyeContext !== null) {
-                    birdsEyeContext.imageSmoothingEnabled = false;
-                }
-
-                for (let tileY = minTileY; tileY <= maxTileY; tileY++) {
-                    for (let tileX = minTileX; tileX <= maxTileX; tileX++) {
-                        const key = `${zoom}:${renderZoom}:${tileX}:${tileY}`;
-                        const isVisible = tileX >= visibleMinTileX
-                            && tileX <= visibleMaxTileX
-                            && tileY >= visibleMinTileY
-                            && tileY <= visibleMaxTileY;
-                        nextKeys.add(key);
-
-                        if (!activeTiles.has(key)) {
-                            const image = new Image();
-                            image.draggable = false;
-                            image.decoding = 'async';
-                            image.loading = isVisible ? 'eager' : 'lazy';
-                            image.fetchPriority = isVisible ? 'high' : 'low';
-                            const entry = {
-                                image,
-                                bitmap: null,
-                                loaded: false,
-                                failed: false,
-                                loading: true,
-                                usingApiFallback: false,
-                                retryAt: 0,
-                            };
-                            image.onload = async () => {
-                                entry.loading = false;
-                                entry.failed = false;
-                                entry.loaded = true;
-                                entry.retryAt = 0;
-                                if (typeof createImageBitmap === 'function') {
-                                    try {
-                                        entry.bitmap = await createImageBitmap(image);
-                                    } catch {
-                                        entry.bitmap = null;
-                                    }
-                                }
-                                requestRenderTiles();
-                            };
-                            image.onerror = () => {
-                                if (!entry.usingApiFallback) {
-                                    entry.usingApiFallback = true;
-                                    image.src = urlWithRetryToken(apiTileUrl(renderZoom, tileX, tileY));
-                                    return;
-                                }
-
-                                entry.loading = false;
-                                entry.failed = true;
-                                entry.retryAt = performance.now() + birdsEyeTileRetryDelayMs;
-                                requestRenderTiles();
-                            };
-                            image.src = tileUrl(renderZoom, tileX, tileY);
-                            activeTiles.set(key, entry);
-                        }
-
-                        const tileEntry = activeTiles.get(key);
-                        tileEntry.image.loading = isVisible ? 'eager' : 'lazy';
-                        tileEntry.image.fetchPriority = isVisible ? 'high' : 'low';
-
-                        if (isVisible) {
-                            visibleTileCount++;
-                            if (tileEntry.failed && !tileEntry.loading && renderNow >= tileEntry.retryAt) {
-                                tileEntry.failed = false;
-                                tileEntry.loaded = false;
-                                tileEntry.loading = true;
-                                tileEntry.usingApiFallback = false;
-                                tileEntry.retryAt = 0;
-                                if (tileEntry.bitmap && typeof tileEntry.bitmap.close === 'function') {
-                                    tileEntry.bitmap.close();
-                                }
-                                tileEntry.bitmap = null;
-                                tileEntry.image.src = urlWithRetryToken(tileUrl(renderZoom, tileX, tileY));
-                                pendingTileCount++;
-                                continue;
-                            }
-
-                            if (tileEntry.failed && !tileEntry.loading && nextRetryAt === null) {
-                                nextRetryAt = tileEntry.retryAt;
-                            } else if (tileEntry.failed && !tileEntry.loading && tileEntry.retryAt < nextRetryAt) {
-                                nextRetryAt = tileEntry.retryAt;
-                            }
-
-                            if (tileEntry.loaded && !tileEntry.failed && birdsEyeContext !== null) {
-                                const drawX = (tileX * scaledTileSize) - offsetX;
-                                const drawY = (tileY * scaledTileSize) - offsetY;
-                                const drawSource = tileEntry.bitmap ?? tileEntry.image;
-                                birdsEyeContext.drawImage(drawSource, drawX, drawY, scaledTileSize, scaledTileSize);
-                                drawnTileCount++;
-                            } else if (!tileEntry.failed) {
-                                pendingTileCount++;
-                            }
-                        }
+                    if (!intersectsViewport) {
+                        continue;
                     }
-                }
 
-                for (const [key, tileEntry] of activeTiles.entries()) {
-                    if (!nextKeys.has(key)) {
-                        if (tileEntry?.bitmap && typeof tileEntry.bitmap.close === 'function') {
-                            tileEntry.bitmap.close();
-                        }
-                        activeTiles.delete(key);
+                    visibleLayerCount++;
+
+                    if (!cacheEntry) {
+                        continue;
                     }
+
+                    if (!cacheEntry.loaded && !cacheEntry.failed && !cacheEntry.requested) {
+                        requestBirdsEyeLayerImage(cacheEntry, true);
+                    }
+
+                    if (!cacheEntry.loaded || cacheEntry.failed) {
+                        if (!cacheEntry.failed) {
+                            pendingLayerCount++;
+                        }
+
+                        continue;
+                    }
+
+                    const clipX = Math.max(0, Math.floor(layerLeft));
+                    const clipY = Math.max(0, Math.floor(layerTop));
+                    const clipX2 = Math.min(viewport.clientWidth, Math.ceil(layerRight));
+                    const clipY2 = Math.min(viewport.clientHeight, Math.ceil(layerBottom));
+                    const clipWidth = clipX2 - clipX;
+                    const clipHeight = clipY2 - clipY;
+
+                    if (clipWidth <= 0 || clipHeight <= 0) {
+                        continue;
+                    }
+
+                    const drawable = cacheEntry.bitmap ?? cacheEntry.image ?? null;
+                    if (!drawable) {
+                        pendingLayerCount++;
+                        continue;
+                    }
+
+                    const seamOverlapPx = 0.75;
+                    const drawLeft = layerLeft - seamOverlapPx;
+                    const drawTop = layerTop - seamOverlapPx;
+                    const drawWidth = (layerRight - layerLeft) + (seamOverlapPx * 2);
+                    const drawHeight = (layerBottom - layerTop) + (seamOverlapPx * 2);
+                    birdsEyeContext.save();
+                    birdsEyeContext.beginPath();
+                    birdsEyeContext.rect(clipX, clipY, clipWidth, clipHeight);
+                    birdsEyeContext.clip();
+                    birdsEyeContext.drawImage(
+                        drawable,
+                        drawLeft,
+                        drawTop,
+                        drawWidth,
+                        drawHeight
+                    );
+                    birdsEyeContext.restore();
+
+                    drawnLayerCount++;
                 }
 
-                zoomEl.textContent = `${zoom} / ${uiMaxZoom()} (src: ${renderZoom})`;
-                tilesEl.textContent = `${info.tiles_x} x ${info.tiles_y}`;
-                visibleTilesEl.textContent = `${drawnTileCount}/${visibleTileCount}`;
+                zoomEl.textContent = `${zoom} / ${uiMaxZoom()}`;
+                tilesEl.textContent = `${info.width} x ${info.height}`;
+                visibleTilesEl.textContent = `${drawnLayerCount}/${visibleLayerCount} layers`;
                 renderMsEl.textContent = `${Math.round(performance.now() - renderStartedAt)}`;
                 renderOverviewMap();
                 scheduleUrlStateSync();
 
-                if (pendingTileCount > 0) {
+                if (pendingLayerCount > 0) {
                     requestRenderTiles();
-                    return;
-                }
-
-                if (nextRetryAt !== null) {
-                    const retryDelay = Math.max(40, Math.ceil(nextRetryAt - renderNow));
-
-                    if (birdsEyeRetryTimer !== null) {
-                        window.clearTimeout(birdsEyeRetryTimer);
-                    }
-
-                    birdsEyeRetryTimer = window.setTimeout(() => {
-                        birdsEyeRetryTimer = null;
-                        requestRenderTiles();
-                    }, retryDelay);
                 }
             }
 
@@ -1636,6 +1787,7 @@
                 const manifestStartedAt = performance.now();
                 const preserveView = options.preserveView === true;
                 const refresh = options.refresh !== false;
+                const preserveWorldCenter = options.preserveWorldCenter ?? null;
                 setStatus('Loading map manifest...');
                 const hadManifest = manifest !== null;
                 const query = buildQueryString();
@@ -1667,13 +1819,17 @@
                 }
                 syncOverviewImage();
                 if (preserveView && hadManifest) {
-                    zoom = Math.min(zoom, uiMaxZoom());
+                    zoom = Math.max(uiMinZoom(), Math.min(zoom, uiMaxZoom()));
+                    applyViewportWorldCenter(preserveWorldCenter);
                     clampOffsets();
                 } else {
                     fitInitialPosition();
                 }
 
                 resetActiveTiles();
+                if (selectedProjection === 'birds-eye') {
+                    syncBirdsEyeLayerCache();
+                }
                 requestRenderTiles();
                 setStatus(`Map loaded (${selectedProjection}, full): ${manifest.source_width} x ${manifest.source_height} blocks`);
                 manifestMsEl.textContent = `${Math.round(performance.now() - manifestStartedAt)}`;
@@ -1861,12 +2017,14 @@
             renderButton.addEventListener('click', renderWorldMap);
             projectionSelect.addEventListener('change', () => {
                 stopBatchPolling();
+                const preserveWorldCenter = currentViewportWorldCenter();
                 selectedProjection = projectionSelect.value || 'birds-eye';
                 resetActiveTiles();
                 syncProjectionLayers();
                 scheduleUrlStateSync();
                 loadManifest({
-                    preserveView: false,
+                    preserveView: true,
+                    preserveWorldCenter,
                     refresh: true,
                 }).catch(error => setStatus(error.message));
             });

@@ -2,7 +2,6 @@
 
 namespace App\Services;
 
-use App\Jobs\GenerateRegionTilesJob;
 use App\Jobs\RenderRegionMapImageJob;
 use Illuminate\Support\Facades\Bus;
 use RuntimeException;
@@ -20,7 +19,7 @@ class DispatchBirdsEyeMapBatch
     public function dispatch(string $heightmapType = 'WORLD_SURFACE', ?array $priorityContext = null): array
     {
         if (! extension_loaded('gd')) {
-            throw new RuntimeException('The GD extension is required to render map tiles.');
+            throw new RuntimeException('The GD extension is required to render map images.');
         }
 
         $regionFiles = $this->minecraftRegionReader->listRegionFiles();
@@ -43,10 +42,10 @@ class DispatchBirdsEyeMapBatch
             ];
         }
 
-        $jobs = array_map(fn (string $regionFile): array => [
-            new RenderRegionMapImageJob($regionFile, $heightmapType),
-            new GenerateRegionTilesJob($regionFile),
-        ], $regionsToQueue);
+        $jobs = array_map(
+            fn (string $regionFile): RenderRegionMapImageJob => new RenderRegionMapImageJob($regionFile, $heightmapType),
+            $regionsToQueue
+        );
 
         $batch = Bus::batch($jobs)
             ->name('Render Minecraft birds-eye map')

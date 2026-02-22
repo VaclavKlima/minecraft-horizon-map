@@ -1,6 +1,5 @@
 <?php
 
-use App\Jobs\GenerateRegionTilesJob;
 use App\Jobs\RenderRegionMapImageJob;
 use Illuminate\Support\Facades\Bus;
 
@@ -30,10 +29,7 @@ it('queues birds-eye map jobs through the api', function () {
         Bus::assertBatched(function ($batch): bool {
             return count($batch->jobs) > 0
                 && collect($batch->jobs)->every(
-                    fn (mixed $jobs): bool => is_array($jobs)
-                        && count($jobs) === 2
-                        && $jobs[0] instanceof RenderRegionMapImageJob
-                        && $jobs[1] instanceof GenerateRegionTilesJob
+                    fn (mixed $job): bool => $job instanceof RenderRegionMapImageJob
                 );
         });
 
@@ -47,16 +43,13 @@ it('queues birds-eye map jobs through the api', function () {
 it('queues birds-eye map jobs through the command', function () {
     Bus::fake();
 
-    $this->artisan('map:render-birdeye --heightmap=WORLD_SURFACE')
+    $this->artisan('map:render --heightmap=WORLD_SURFACE --projection=birds-eye')
         ->assertSuccessful();
 
     $matchingBatches = Bus::batched(function ($batch): bool {
         return count($batch->jobs) > 0
             && collect($batch->jobs)->every(
-                fn (mixed $jobs): bool => is_array($jobs)
-                    && count($jobs) === 2
-                    && $jobs[0] instanceof RenderRegionMapImageJob
-                    && $jobs[1] instanceof GenerateRegionTilesJob
+                fn (mixed $job): bool => $job instanceof RenderRegionMapImageJob
             );
     });
 
