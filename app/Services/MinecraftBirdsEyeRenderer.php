@@ -3,6 +3,7 @@
 namespace App\Services;
 
 use Illuminate\Filesystem\Filesystem;
+use Illuminate\Support\Facades\Log;
 use RuntimeException;
 
 class MinecraftBirdsEyeRenderer
@@ -12,6 +13,13 @@ class MinecraftBirdsEyeRenderer
     private const HEIGHT_BASELINE = -128;
 
     private const HEIGHT_CEILING = 384;
+
+    private const MISSING_BLOCK_COLORS_LOG = 'logs/isometric-missing-blocks.log';
+
+    /**
+     * @var array<string, true>
+     */
+    private array $loggedMissingColorBlocks = [];
 
     public function __construct(private Filesystem $files, private MinecraftRegionReader $minecraftRegionReader) {}
 
@@ -1463,7 +1471,7 @@ class MinecraftBirdsEyeRenderer
      */
     private function colorForBlock(string $blockName): array
     {
-        return match ($blockName) {
+        $explicitColor = match ($blockName) {
             'minecraft:water', 'minecraft:bubble_column' => [52, 98, 182],
             'minecraft:lava' => [238, 108, 34],
             'minecraft:grass_block', 'minecraft:moss_block' => [106, 167, 69],
@@ -1472,8 +1480,16 @@ class MinecraftBirdsEyeRenderer
             'minecraft:stone', 'minecraft:andesite', 'minecraft:diorite', 'minecraft:granite', 'minecraft:cobblestone' => [125, 125, 125],
             'minecraft:deepslate', 'minecraft:cobbled_deepslate' => [78, 78, 84],
             'minecraft:snow', 'minecraft:snow_block', 'minecraft:powder_snow' => [240, 243, 247],
-            default => $this->colorForBlockByHeuristic($blockName),
+            default => null,
         };
+
+        if ($explicitColor !== null) {
+            return $explicitColor;
+        }
+
+        $this->logMissingColorBlock($blockName);
+
+        return $this->colorForBlockByHeuristic($blockName);
     }
 
     /**
@@ -1600,6 +1616,22 @@ class MinecraftBirdsEyeRenderer
         }
 
         return $quotient;
+    }
+
+    private function logMissingColorBlock(string $blockName): void
+    {
+        if (isset($this->loggedMissingColorBlocks[$blockName])) {
+            return;
+        }
+
+        $this->loggedMissingColorBlocks[$blockName] = true;
+
+        Log::build([
+            'driver' => 'single',
+            'path' => storage_path(self::MISSING_BLOCK_COLORS_LOG),
+        ])->info('missing block color mapping', [
+            'block' => $blockName,
+        ]);
     }
 
     private function readChunkPayload(string $regionBinary, int $offsetSectors): ?string

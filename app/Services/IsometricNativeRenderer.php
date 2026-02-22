@@ -9,6 +9,8 @@ use Symfony\Component\Process\Process;
 
 class IsometricNativeRenderer
 {
+    private const MISSING_BLOCKS_LOG = 'logs/isometric-missing-blocks.log';
+
     public function __construct(private Filesystem $files) {}
 
     /**
@@ -72,6 +74,7 @@ class IsometricNativeRenderer
             ]);
             $process->setTimeout((float) config('render.isometric_native_timeout_seconds', 300));
             $process->run();
+            $this->appendMissingPaletteColorLogs($regionFile, $process->getErrorOutput());
 
             if (! $process->isSuccessful()) {
                 if ($process->getExitCode() === 3) {
@@ -131,6 +134,48 @@ class IsometricNativeRenderer
             'width_blocks' => $isoWidth,
             'height_blocks' => $isoHeight,
         ];
+    }
+
+    private function appendMissingPaletteColorLogs(string $regionFile, string $stderr): void
+    {
+        $trimmed = trim($stderr);
+
+        if ($trimmed === '') {
+            return;
+        }
+
+        $lines = preg_split('/\R/u', $trimmed) ?: [];
+        $missingLines = [];
+
+        foreach ($lines as $line) {
+            $line = trim($line);
+
+            if ($line === '') {
+                continue;
+            }
+
+            if (
+                str_starts_with($line, 'missing palette color:')
+                || str_starts_with($line, 'encountered ')
+            ) {
+                $missingLines[] = $line;
+            }
+        }
+
+        if ($missingLines === []) {
+            return;
+        }
+
+        $logPath = storage_path(self::MISSING_BLOCKS_LOG);
+        $this->files->ensureDirectoryExists(dirname($logPath));
+        $timestamp = now()->format('Y-m-d H:i:s');
+
+        foreach ($missingLines as $missingLine) {
+            $this->files->append(
+                $logPath,
+                sprintf('[%s] region=%s %s%s', $timestamp, $regionFile, $missingLine, PHP_EOL)
+            );
+        }
     }
 
     /**

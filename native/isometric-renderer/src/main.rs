@@ -1,5 +1,5 @@
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::fs::File;
 use std::io::BufWriter;
@@ -289,12 +289,8 @@ fn uses_foliage_tint(section: &SectionInput, palette_index: usize) -> bool {
         .unwrap_or(false)
 }
 
-fn palette_color(section: &SectionInput, palette_index: usize) -> [u8; 3] {
-    section
-        .palette_colors
-        .get(palette_index)
-        .copied()
-        .unwrap_or([90, 90, 92])
+fn palette_color(section: &SectionInput, palette_index: usize) -> Option<[u8; 3]> {
+    section.palette_colors.get(palette_index).copied()
 }
 
 fn biome_palette_index_at(
@@ -457,6 +453,24 @@ fn is_voxel_solid(occupancy: &[u8], voxel_index: usize) -> bool {
     (occupancy[byte_index] & (1u8 << bit_index)) != 0
 }
 
+fn log_missing_palette_color(
+    logged_missing_palette_colors: &mut HashSet<(i32, i32, i32, usize)>,
+    chunk_x: i32,
+    chunk_z: i32,
+    section_y: i32,
+    palette_index: usize,
+    palette_color_count: usize,
+) {
+    if !logged_missing_palette_colors.insert((chunk_x, chunk_z, section_y, palette_index)) {
+        return;
+    }
+
+    eprintln!(
+        "missing palette color: chunk=({}, {}), section_y={}, palette_index={}, palette_colors_len={}",
+        chunk_x, chunk_z, section_y, palette_index, palette_color_count
+    );
+}
+
 fn main() -> ExitCode {
     let args = match parse_args() {
         Ok(args) => args,
@@ -607,6 +621,7 @@ fn main() -> ExitCode {
     let mut occupancy = vec![0u8; (total_voxels + 7) / 8];
     let mut colors = vec![0u8; total_voxels * 3];
     let mut water_mask = vec![0u8; total_voxels];
+    let mut logged_missing_palette_colors: HashSet<(i32, i32, i32, usize)> = HashSet::new();
 
     for chunk in &input.chunks {
         let Some((min_local_x, max_local_x, min_local_z, max_local_z)) =
@@ -624,7 +639,17 @@ fn main() -> ExitCode {
                     continue;
                 }
 
-                let color = palette_color(section, uniform_palette_index);
+                let color = palette_color(section, uniform_palette_index).unwrap_or_else(|| {
+                    log_missing_palette_color(
+                        &mut logged_missing_palette_colors,
+                        chunk.chunk_x,
+                        chunk.chunk_z,
+                        section.section_y,
+                        uniform_palette_index,
+                        section.palette_colors.len(),
+                    );
+                    [90, 90, 92]
+                });
                 let is_water = is_water_palette(section, uniform_palette_index);
 
                 for local_y in 0..16usize {
@@ -689,7 +714,17 @@ fn main() -> ExitCode {
                             continue;
                         }
 
-                        let color = palette_color(section, palette_index);
+                        let color = palette_color(section, palette_index).unwrap_or_else(|| {
+                            log_missing_palette_color(
+                                &mut logged_missing_palette_colors,
+                                chunk.chunk_x,
+                                chunk.chunk_z,
+                                section.section_y,
+                                palette_index,
+                                section.palette_colors.len(),
+                            );
+                            [90, 90, 92]
+                        });
                         let is_water = is_water_palette(section, palette_index);
                         let biome_index =
                             biome_palette_index_at(section, local_x, local_z, local_y);
@@ -722,17 +757,42 @@ fn main() -> ExitCode {
 
     let mut water_depths = vec![0u16; total_voxels];
     for column_index in 0..total_columns {
-        let mut current_depth = 0u16;
         let column_base_index = column_index * height_span;
+        let mut segment_top: Option<usize> = None;
+        let mut segment_length: usize = 0;
 
         for y_offset in (0..height_span).rev() {
             let voxel_index = column_base_index + y_offset;
+            let is_water_voxel =
+                is_voxel_solid(&occupancy, voxel_index) && water_mask[voxel_index] == 1;
 
-            if is_voxel_solid(&occupancy, voxel_index) && water_mask[voxel_index] == 1 {
-                current_depth = current_depth.saturating_add(1);
-                water_depths[voxel_index] = current_depth;
-            } else {
-                current_depth = 0;
+            if is_water_voxel {
+                if segment_top.is_none() {
+                    segment_top = Some(y_offset);
+                }
+
+                segment_length += 1;
+                continue;
+            }
+
+            if let Some(top) = segment_top {
+                let bottom = y_offset + 1;
+                let clamped_depth = segment_length.min(u16::MAX as usize) as u16;
+
+                for fill_y in bottom..=top {
+                    water_depths[column_base_index + fill_y] = clamped_depth;
+                }
+            }
+
+            segment_top = None;
+            segment_length = 0;
+        }
+
+        if let Some(top) = segment_top {
+            let clamped_depth = segment_length.min(u16::MAX as usize) as u16;
+
+            for fill_y in 0..=top {
+                water_depths[column_base_index + fill_y] = clamped_depth;
             }
         }
     }
@@ -1128,6 +1188,13 @@ fn main() -> ExitCode {
         eprintln!("{error}");
 
         return ExitCode::from(1);
+    }
+
+    if !logged_missing_palette_colors.is_empty() {
+        eprintln!(
+            "encountered {} unique missing palette color entries",
+            logged_missing_palette_colors.len()
+        );
     }
 
     println!(
